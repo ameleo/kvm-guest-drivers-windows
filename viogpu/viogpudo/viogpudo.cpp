@@ -483,6 +483,10 @@ NTSTATUS VioGpuDod::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQuery
                     pDriverCaps->MaxPointerHeight = POINTER_SIZE;
                     pDriverCaps->PointerCaps.Color = 1;
                     pDriverCaps->PointerCaps.MaskedColor = 1;
+                    // Advertise monochrome HW cursors too (e.g. the text I-beam); otherwise
+                    // Windows renders them as a software cursor composited into the framebuffer
+                    // — captured into the video/remote stream and laggy (issue #977 follow-up).
+                    pDriverCaps->PointerCaps.Monochrome = 1;
                 }
                 pDriverCaps->SupportNonVGA = IsVgaDevice();
                 pDriverCaps->SupportSmoothRotation = TRUE;
@@ -2967,12 +2971,10 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
               pSetPointerShape->XHot,
               pSetPointerShape->YHot));
 
-    if (pSetPointerShape->Flags.Monochrome)
-    {
-        VioGpuDbgBreak();
-        return STATUS_UNSUCCESSFUL;
-    }
-
+    // Monochrome (and masked-color) cursors are now converted to A8R8G8B8 inside UpdateCursor,
+    // so we must NOT reject them here — otherwise Windows falls back to a SOFTWARE cursor
+    // composited into the framebuffer (captured into the video/remote stream, laggy + double
+    // with the client's own cursor). This gate was what kept the I-beam in software. (#977 follow-up)
     if (UpdateCursor(pSetPointerShape, pModeCur))
     {
         PGPU_UPDATE_CURSOR crsr;
@@ -3932,6 +3934,76 @@ BOOLEAN VioGpuAdapter::CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     return status;
 }
 
+// Converts a Windows monochrome pointer to A8R8G8B8 in the cursor resource.
+// Source = 1bpp AND mask (Width x Height) immediately followed by the 1bpp XOR mask.
+// AND/XOR semantics: 0/0 = opaque black, 0/1 = opaque white, 1/0 = transparent,
+// 1/1 = invert-screen (unsupported on virtio-gpu -> rendered as opaque black).
+static void ConvertMonochromeToBgra(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, BYTE *dst, ULONG dstPitch)
+{
+    const BYTE *src = (const BYTE *)pSetPointerShape->pPixels;
+    const ULONG srcPitch = pSetPointerShape->Pitch;
+    UINT w = pSetPointerShape->Width;
+    UINT h = pSetPointerShape->Height;
+    if (w > POINTER_SIZE)
+        w = POINTER_SIZE;
+    if (h > POINTER_SIZE)
+        h = POINTER_SIZE;
+
+    for (UINT y = 0; y < h; y++)
+    {
+        const BYTE *andRow = src + (size_t)y * srcPitch;
+        const BYTE *xorRow = src + (size_t)(pSetPointerShape->Height + y) * srcPitch;
+        ULONG *dstRow = (ULONG *)(dst + (size_t)y * dstPitch);
+        for (UINT x = 0; x < w; x++)
+        {
+            BYTE bit = (BYTE)(0x80 >> (x & 7));
+            BOOLEAN a = (andRow[x >> 3] & bit) != 0;
+            BOOLEAN xo = (xorRow[x >> 3] & bit) != 0;
+            if (!a && !xo)
+                dstRow[x] = 0xFF000000; // opaque black
+            else if (!a && xo)
+                dstRow[x] = 0xFFFFFFFF; // opaque white
+            else if (a && !xo)
+                dstRow[x] = 0x00000000; // transparent
+            else
+                dstRow[x] = 0xFF000000; // invert -> opaque black (best effort)
+        }
+    }
+}
+
+// Masked-color pointer: src = Width x Height of 32bpp BGRA where the alpha byte acts as the
+// AND mask (0x00 = opaque color, 0xFF = XOR/transparent). virtio-gpu can't XOR, so:
+// A==0 -> opaque RGB, A==0xFF & RGB==0 -> transparent, A==0xFF & RGB!=0 -> opaque RGB (best effort).
+static void ConvertMaskedColorToBgra(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, BYTE *dst, ULONG dstPitch)
+{
+    const BYTE *src = (const BYTE *)pSetPointerShape->pPixels;
+    const ULONG srcPitch = pSetPointerShape->Pitch;
+    UINT w = pSetPointerShape->Width;
+    UINT h = pSetPointerShape->Height;
+    if (w > POINTER_SIZE)
+        w = POINTER_SIZE;
+    if (h > POINTER_SIZE)
+        h = POINTER_SIZE;
+
+    for (UINT y = 0; y < h; y++)
+    {
+        const ULONG *srcRow = (const ULONG *)(src + (size_t)y * srcPitch);
+        ULONG *dstRow = (ULONG *)(dst + (size_t)y * dstPitch);
+        for (UINT x = 0; x < w; x++)
+        {
+            ULONG px = srcRow[x];
+            ULONG rgb = px & 0x00FFFFFF;
+            BYTE a = (BYTE)(px >> 24);
+            if (a == 0)
+                dstRow[x] = 0xFF000000 | rgb; // opaque color
+            else if (rgb == 0)
+                dstRow[x] = 0x00000000; // transparent
+            else
+                dstRow[x] = 0xFF000000 | rgb; // invert -> opaque color (best effort)
+        }
+    }
+}
+
 BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape,
                                     _In_ CONST CURRENT_MODE *pCurrentMode)
 {
@@ -3959,28 +4031,48 @@ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     DstBltInfo.Width = POINTER_SIZE;
     DstBltInfo.Height = POINTER_SIZE;
 
-    BLT_INFO SrcBltInfo;
-    SrcBltInfo.pBits = (PVOID)pSetPointerShape->pPixels;
-    SrcBltInfo.Pitch = pSetPointerShape->Pitch;
     if (pSetPointerShape->Flags.Color)
     {
+        BLT_INFO SrcBltInfo;
+        SrcBltInfo.pBits = (PVOID)pSetPointerShape->pPixels;
+        SrcBltInfo.Pitch = pSetPointerShape->Pitch;
         SrcBltInfo.BitsPerPel = BPPFromPixelFormat(D3DDDIFMT_A8R8G8B8);
+        SrcBltInfo.Offset.x = 0;
+        SrcBltInfo.Offset.y = 0;
+        SrcBltInfo.Rotation = pCurrentMode->Rotation;
+        SrcBltInfo.Width = pSetPointerShape->Width;
+        SrcBltInfo.Height = pSetPointerShape->Height;
+        BltBits(&DstBltInfo, &SrcBltInfo, &Rect);
+    }
+    else if (pSetPointerShape->Flags.Monochrome)
+    {
+        // Monochrome cursor (e.g. the text I-beam). Without this, SetPointerShape would fail
+        // for mono shapes and Windows would fall back to a SOFTWARE cursor composited into the
+        // framebuffer -> captured into the video/remote stream and laggy (and shown alongside
+        // the client's own cursor). Convert the 1bpp AND/XOR masks to A8R8G8B8 and push them
+        // through the same hardware-cursor path.
+        RtlZeroMemory(DstBltInfo.pBits, (size_t)DstBltInfo.Pitch * POINTER_SIZE);
+        ConvertMonochromeToBgra(pSetPointerShape, (BYTE *)DstBltInfo.pBits, DstBltInfo.Pitch);
+    }
+    else if (pSetPointerShape->Flags.MaskedColor)
+    {
+        // Masked-color cursor (some text/I-beam cursors come this way). Same rationale as the
+        // monochrome case: otherwise Windows software-renders it into the framebuffer where it
+        // gets captured into the video/remote stream (laggy + double with the client cursor).
+        RtlZeroMemory(DstBltInfo.pBits, (size_t)DstBltInfo.Pitch * POINTER_SIZE);
+        ConvertMaskedColorToBgra(pSetPointerShape, (BYTE *)DstBltInfo.pBits, DstBltInfo.Pitch);
     }
     else
     {
         VioGpuDbgBreak();
-        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Invalid cursor color %d\n", __FUNCTION__, pSetPointerShape->Flags.Value));
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Invalid cursor flags %d\n", __FUNCTION__, pSetPointerShape->Flags.Value));
         return FALSE;
     }
-    SrcBltInfo.Offset.x = 0;
-    SrcBltInfo.Offset.y = 0;
-    SrcBltInfo.Rotation = pCurrentMode->Rotation;
-    SrcBltInfo.Width = pSetPointerShape->Width;
-    SrcBltInfo.Height = pSetPointerShape->Height;
 
-    BltBits(&DstBltInfo, &SrcBltInfo, &Rect);
-
-    m_CtrlQueue.TransferToHost2D(m_pCursorBuf->GetId(), 0, pSetPointerShape->Width, pSetPointerShape->Height, 0, 0);
+    // Wait for the transfer to complete before SetPointerShape() issues the
+    // UPDATE_CURSOR command on the separate cursor queue, otherwise the device
+    // may show a stale cursor image (issue #977).
+    m_CtrlQueue.TransferToHost2D(m_pCursorBuf->GetId(), 0, pSetPointerShape->Width, pSetPointerShape->Height, 0, 0, TRUE);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
