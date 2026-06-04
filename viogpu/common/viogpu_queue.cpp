@@ -363,7 +363,7 @@ void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y)
+void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y, BOOLEAN wait)
 {
     PAGED_CODE();
 
@@ -381,7 +381,41 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
     cmd->r.x = x;
     cmd->r.y = y;
 
-    QueueBuffer(vbuf);
+    if (wait)
+    {
+        // Synchronous: wait until the host has applied the transfer before
+        // returning. The cursor path issues UPDATE_CURSOR on the *separate*
+        // cursor queue right after; without this wait the device may process
+        // UPDATE_CURSOR before this transfer completes and display a stale
+        // cursor image (issue #977). Completing the transfer on the control
+        // queue guarantees the resource is up to date when UPDATE_CURSOR runs.
+        KEVENT event;
+        NTSTATUS status;
+        KeInitializeEvent(&event, NotificationEvent, FALSE);
+        vbuf->complete_cb = NotifyEventCompleteCB;
+        vbuf->complete_ctx = &event;
+        vbuf->auto_release = false;
+
+        LARGE_INTEGER timeout = {0};
+        timeout.QuadPart = Int32x32To64(100, -10000); // 100 ms safety net
+
+        QueueBuffer(vbuf);
+        status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+        if (status == STATUS_TIMEOUT)
+        {
+            // Device did not complete in time; the buffer may still be in
+            // flight, so leak it rather than free a buffer the device owns.
+            DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s transfer wait timed out\n", __FUNCTION__));
+        }
+        else
+        {
+            ReleaseBuffer(vbuf);
+        }
+    }
+    else
+    {
+        QueueBuffer(vbuf);
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
