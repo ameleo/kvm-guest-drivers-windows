@@ -77,7 +77,7 @@ class VioGpuAdapter : IVioGpuPCI
   public:
     VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod);
     ~VioGpuAdapter(void);
-    NTSTATUS SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode);
+    NTSTATUS SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode, UINT scanId);
     ULONG GetModeCount(void)
     {
         return m_ModeCount;
@@ -121,7 +121,16 @@ class VioGpuAdapter : IVioGpuPCI
     }
     SIZE_T GetFrameSegmentSize(void)
     {
-        return m_FrameSegment.GetSize();
+        return m_FrameSegment[0].GetSize();
+    }
+    ULONG GetNumScanouts(void)
+    {
+        ULONG n = m_u32NumScanouts;
+        if (n < 1)
+            n = 1;
+        if (n > MAX_SCANOUTS)
+            n = MAX_SCANOUTS;
+        return n;
     }
     PDXGKRNL_INTERFACE GetDxgkInterface(void);
 
@@ -133,13 +142,13 @@ class VioGpuAdapter : IVioGpuPCI
     {
         return (USHORT)m_ModeInfo[idx].ModeIndex;
     }
-    USHORT GetCurrentModeIndex(void)
+    USHORT GetCurrentModeIndex(UINT scanId)
     {
-        return m_CurrentModeIndex;
+        return m_CurrentModeIndex[scanId];
     }
-    VOID SetCurrentModeIndex(USHORT idx)
+    VOID SetCurrentModeIndex(UINT scanId, USHORT idx)
     {
-        m_CurrentModeIndex = idx;
+        m_CurrentModeIndex[scanId] = idx;
     }
     VioGpuDod *GetVioGpu(void)
     {
@@ -149,7 +158,7 @@ class VioGpuAdapter : IVioGpuPCI
     {
         return m_Id;
     }
-    PBYTE GetEdidData(void);
+    PBYTE GetEdidData(UINT scanId = 0);
     PBYTE GetCTA861Data(void);
 
   protected:
@@ -167,8 +176,8 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
     NTSTATUS UpdateChildStatus(BOOLEAN connect);
     void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
-    BOOLEAN CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode);
-    void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer);
+    BOOLEAN CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode, UINT scanId);
+    void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId);
     BOOLEAN CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     BOOLEAN UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     void DestroyCursor(void);
@@ -185,11 +194,11 @@ class VioGpuAdapter : IVioGpuPCI
     VioGpuDod *m_pVioGpuDod;
     PVIDEO_MODE_INFORMATION m_ModeInfo;
     ULONG m_ModeCount;
-    USHORT m_CurrentModeIndex;
+    USHORT m_CurrentModeIndex[MAX_SCANOUTS];
     USHORT m_CustomModeIndex;
     ULONG m_Id;
-    BYTE m_EDIDs[EDID_RAW_BLOCK_SIZE];
-    BOOLEAN m_bEDID;
+    BYTE m_EDIDs[MAX_SCANOUTS][EDID_RAW_BLOCK_SIZE];
+    BOOLEAN m_bEDID[MAX_SCANOUTS];
 
     VirtIODevice m_VioDev;
     CPciResources m_PciResources;
@@ -201,10 +210,10 @@ class VioGpuAdapter : IVioGpuPCI
     CrsrQueue m_CursorQueue;
     VioGpuBuf m_GpuBuf;
     VioGpuIdr m_Idr;
-    VioGpuObj *m_pFrameBuf;
+    VioGpuObj *m_pFrameBuf[MAX_SCANOUTS];
     VioGpuObj *m_pCursorBuf;
     VioGpuMemSegment m_CursorSegment;
-    VioGpuMemSegment m_FrameSegment;
+    VioGpuMemSegment m_FrameSegment[MAX_SCANOUTS];
     volatile ULONG m_PendingWorks;
     KEVENT m_ConfigUpdateEvent;
     PETHREAD m_pWorkThread;
@@ -224,7 +233,7 @@ class VioGpuDod
     DEVICE_POWER_STATE m_AdapterPowerState;
     DRIVER_STATUS_FLAG m_Flags;
 
-    CURRENT_MODE m_CurrentMode;
+    CURRENT_MODE m_CurrentMode[MAX_VIEWS];
 
     DXGK_DISPLAY_INFORMATION m_SystemDisplayInfo;
 
