@@ -31,8 +31,8 @@
 
 GpuAdapter::GpuAdapter(const std::wstring LinkName)
     : m_hThread(NULL), m_hStopEvent(NULL), m_hResolutionEvent(NULL), m_hDC(NULL), m_hAdapter(NULL), m_Index(-1),
-      m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL), m_pDisplayModeInfo(NULL),
-      m_Flag(None)
+      m_DeviceId(0), m_SourceId(0), m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL),
+      m_pDisplayModeInfo(NULL), m_Flag(None)
 {
     m_DeviceName = LinkName;
     PrintMessage(L"%ws %ws\n", __FUNCTIONW__, m_DeviceName.c_str());
@@ -139,11 +139,14 @@ void GpuAdapter::Init()
     {
         UpdateDisplayConfig();
         m_hAdapter = openAdapter.hAdapter;
+        // This is the head (VidPnSourceId) this \\.\DISPLAYn maps to. Used to
+        // target the right head for the custom resolution and the display path.
+        m_SourceId = openAdapter.VidPnSourceId;
         if (QueryAdapterId())
         {
             std::wstring EventName = GLOBAL_OBJECTS;
             EventName += RESOLUTION_EVENT_NAME;
-            EventName += std::to_wstring(m_Index);
+            EventName += std::to_wstring(m_DeviceId);
             m_hResolutionEvent = ::OpenEvent(EVENT_ALL_ACCESS | EVENT_MODIFY_STATE, FALSE, EventName.c_str());
             if (m_hResolutionEvent == NULL)
             {
@@ -183,7 +186,10 @@ bool GpuAdapter::QueryAdapterId()
         }
         else
         {
-            m_Index = data.Id;
+            // Device id is shared by all heads of this single adapter; keep it only
+            // for the (per-device) resolution event name. Do NOT overwrite m_Index,
+            // which UpdateDisplayConfig already set to this display's path index.
+            m_DeviceId = data.Id;
             return true;
         }
     }
@@ -213,6 +219,7 @@ bool GpuAdapter::GetCustomResolution(PVIOGPU_DISP_MODE pmode)
         VIOGPU_ESCAPE data{0};
         data.DataLength = sizeof(VIOGPU_DISP_MODE);
         data.Type = VIOGPU_GET_CUSTOM_RESOLUTION;
+        data.ScanId = (USHORT)m_SourceId;
 
         D3DKMT_ESCAPE escape = {0};
         escape.hAdapter = m_hAdapter;
@@ -252,13 +259,30 @@ void GpuAdapter::SyncResolution(void)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
+    // Serialize across the per-display agent instances. SetDisplayConfig applies
+    // the FULL topology, so two instances resizing concurrently would each push a
+    // stale snapshot and clobber the other head. Holding one lock while we
+    // re-query the current config and change only our own path keeps the other
+    // head stable when both instances update concurrently.
+    HANDLE hLock = CreateMutex(NULL, FALSE, L"VioGpuResizeLock");
+    if (hLock)
+    {
+        WaitForSingleObject(hLock, 5000);
+    }
+
     VIOGPU_DISP_MODE custom = {0};
     UpdateDisplayConfig();
-    if (GetCustomResolution(&custom))
+    if (GetCustomResolution(&custom) && custom.XResolution && custom.YResolution)
     {
         VIOGPU_DISP_MODE current = {0};
         GetCurrentResolution(&current);
         SetResolution(&custom);
+    }
+
+    if (hLock)
+    {
+        ReleaseMutex(hLock);
+        CloseHandle(hLock);
     }
 }
 
