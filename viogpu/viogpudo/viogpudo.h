@@ -175,7 +175,7 @@ class VioGpuAdapter : IVioGpuPCI
     int AddEdidModes(void);
     BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
     NTSTATUS UpdateChildStatus(BOOLEAN connect);
-    void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
+    void SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ USHORT yres);
     BOOLEAN CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode, UINT scanId);
     void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId);
     BOOLEAN CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
@@ -195,7 +195,7 @@ class VioGpuAdapter : IVioGpuPCI
     PVIDEO_MODE_INFORMATION m_ModeInfo;
     ULONG m_ModeCount;
     USHORT m_CurrentModeIndex[MAX_SCANOUTS];
-    USHORT m_CustomModeIndex;
+    USHORT m_CustomModeIndex[MAX_SCANOUTS];
     ULONG m_Id;
     BYTE m_EDIDs[MAX_SCANOUTS][EDID_RAW_BLOCK_SIZE];
     BOOLEAN m_bEDID[MAX_SCANOUTS];

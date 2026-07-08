@@ -2365,7 +2365,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     RtlZeroMemory(&m_VioDev, sizeof(m_VioDev));
     m_pVioGpuDod = pVioGpuDod;
     RtlZeroMemory(m_CurrentModeIndex, sizeof(m_CurrentModeIndex));
-    m_CustomModeIndex = 0;
+    RtlZeroMemory(m_CustomModeIndex, sizeof(m_CustomModeIndex));
     RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
     RtlZeroMemory(m_bEDID, sizeof(m_bEDID));
     m_ModeInfo = NULL;
@@ -3206,8 +3206,18 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                               size));
                     return STATUS_INVALID_BUFFER_SIZE;
                 }
-                pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex].VisScreenWidth;
-                pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex].VisScreenHeight;
+                {
+                    // Return the custom resolution of the head the caller asks for
+                    // (ScanId == VidPnSourceId, which equals the scanout in practice).
+                    UINT getScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenWidth;
+                    pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenHeight;
+                    DbgPrint(TRACE_LEVEL_FATAL,
+                             ("GET_CUSTOM_RESOLUTION scan %u (%dx%d)\n",
+                              getScan,
+                              pVioGpuEscape->Resolution.XResolution,
+                              pVioGpuEscape->Resolution.YResolution));
+                }
                 break;
             }
         case VIOGPU_SET_CUSTOM_RESOLUTION:
@@ -3238,11 +3248,18 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                           pVioGpuEscape->Resolution.XResolution,
                           pVioGpuEscape->Resolution.YResolution));
 
-                m_pVioGpuDod->SetPersistentDispMode0Width(pVioGpuEscape->Resolution.XResolution);
-                m_pVioGpuDod->SetPersistentDispMode0Height(pVioGpuEscape->Resolution.YResolution);
-                m_pVioGpuDod->SetRegisterConfigInfo();
-                SetCustomDisplay(pVioGpuEscape->Resolution.XResolution, pVioGpuEscape->Resolution.YResolution);
-                SetCurrentModeIndex(0, GetCurrentModeIndex(0));
+                {
+                    UINT setScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    // Only the primary head's custom resolution is persisted across boots.
+                    if (setScan == 0)
+                    {
+                        m_pVioGpuDod->SetPersistentDispMode0Width(pVioGpuEscape->Resolution.XResolution);
+                        m_pVioGpuDod->SetPersistentDispMode0Height(pVioGpuEscape->Resolution.YResolution);
+                        m_pVioGpuDod->SetRegisterConfigInfo();
+                    }
+                    SetCustomDisplay(setScan, pVioGpuEscape->Resolution.XResolution, pVioGpuEscape->Resolution.YResolution);
+                    SetCurrentModeIndex(0, GetCurrentModeIndex(0));
+                }
                 break;
             }
         default:
@@ -3259,29 +3276,37 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
-    PGPU_VBUFFER vbuf = NULL;
-    ULONG xres = 0;
-    ULONG yres = 0;
+    ULONG numScanouts = GetNumScanouts();
+    BOOLEAN any = FALSE;
 
-    for (UINT32 i = 0; i < m_u32NumScanouts; i++)
+    // Read EACH scanout's host-preferred resolution into ITS OWN custom slot.
+    // Only overwrite a slot when the host actually reports a size for that
+    // scanout: clobbering a head that momentarily reports "disabled" with a
+    // nominal size would knock it back to 1024x768 on every config change.
+    for (UINT32 i = 0; i < numScanouts; i++)
     {
+        PGPU_VBUFFER vbuf = NULL;
+        ULONG xres = 0;
+        ULONG yres = 0;
+        BOOLEAN ok = FALSE;
+
         if (m_CtrlQueue.AskDisplayInfo(&vbuf))
         {
-            m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
+            ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
             m_CtrlQueue.ReleaseBuffer(vbuf);
-            if (xres && yres)
-            {
-                DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s (%dx%d)\n", __FUNCTION__, xres, yres));
-                SetCustomDisplay((USHORT)xres, (USHORT)yres);
-                return TRUE;
-            }
+        }
+
+        DbgPrint(TRACE_LEVEL_FATAL, ("GetDisplayInfo scan %u ok=%d (%dx%d)\n", i, ok, xres, yres));
+
+        if (ok && xres && yres)
+        {
+            SetCustomDisplay(i, (USHORT)xres, (USHORT)yres);
+            any = TRUE;
         }
     }
-    xres = NOM_WIDTH_SIZE;
-    yres = NOM_HEIGHT_SIZE;
-    SetCustomDisplay((USHORT)xres, (USHORT)yres);
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
-    return FALSE;
+    return any;
 }
 
 int VioGpuAdapter::ProcessEdid(void)
@@ -3641,9 +3666,14 @@ NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
     return Status;
 }
 
-void VioGpuAdapter::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
+void VioGpuAdapter::SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ USHORT yres)
 {
     PAGED_CODE();
+
+    if (scanId >= MAX_SCANOUTS)
+    {
+        scanId = 0;
+    }
 
     VIOGPU_DISP_MODE tmpModeInfo = {0};
 
@@ -3656,9 +3686,13 @@ void VioGpuAdapter::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     tmpModeInfo.YResolution = m_pVioGpuDod->IsFlexResolution() ? yres : max(MIN_HEIGHT_SIZE, yres);
 
     DbgPrint(TRACE_LEVEL_FATAL,
-             ("%s - %d (%dx%d)\n", __FUNCTION__, m_CustomModeIndex, tmpModeInfo.XResolution, tmpModeInfo.YResolution));
+             ("SetCustomDisplay scan %u slot %d (%dx%d)\n",
+              scanId,
+              m_CustomModeIndex[scanId],
+              tmpModeInfo.XResolution,
+              tmpModeInfo.YResolution));
 
-    SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
+    SetVideoModeInfo(m_CustomModeIndex[scanId], &tmpModeInfo);
 }
 
 NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
@@ -3673,7 +3707,10 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
     m_ModeInfo = NULL;
     m_ModeCount = 0;
 
-    m_ModeCount = ProcessEdid() + 1;
+    // Reserve one custom mode slot PER scanout at the end of the list, so each
+    // head can carry its own resize target without overwriting the others.
+    ULONG numScanouts = GetNumScanouts();
+    m_ModeCount = ProcessEdid() + numScanouts;
 
     m_ModeInfo = new (PagedPool) VIDEO_MODE_INFORMATION[m_ModeCount];
     if (!m_ModeInfo)
@@ -3691,7 +3728,7 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
     pDispInfo->ColorFormat = D3DDDIFMT_X8R8G8B8;
     pDispInfo->Pitch = (BPPFromPixelFormat(pDispInfo->ColorFormat) / BITS_PER_BYTE) * pDispInfo->Width;
 
-    for (USHORT indx = 0; indx < m_ModeCount - 1; indx++)
+    for (USHORT indx = 0; indx < m_ModeCount - numScanouts; indx++)
     {
 
         PVIOGPU_DISP_MODE pModeInfo = &gpu_disp_modes[indx];
@@ -3716,7 +3753,14 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
         }
     }
 
-    m_CustomModeIndex = (USHORT)(m_ModeCount - 1);
+    // Custom slots are the last numScanouts entries: m_CustomModeIndex[i] = base + i.
+    // Seed each with a valid default so a head that never reports a host size is
+    // still a usable mode (GetDisplayInfo refines it when a real size arrives).
+    for (UINT i = 0; i < numScanouts; i++)
+    {
+        m_CustomModeIndex[i] = (USHORT)(m_ModeCount - numScanouts + i);
+        SetCustomDisplay(i, NOM_WIDTH_SIZE, NOM_HEIGHT_SIZE);
+    }
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("ModeCount filtered %d\n", m_ModeCount));
 
@@ -3724,7 +3768,7 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
 
     if (m_pVioGpuDod->IsPersistentDispMode0Set())
     {
-        SetCustomDisplay(m_pVioGpuDod->GetPersistentDispMode0Width(), m_pVioGpuDod->GetPersistentDispMode0Height());
+        SetCustomDisplay(0, m_pVioGpuDod->GetPersistentDispMode0Width(), m_pVioGpuDod->GetPersistentDispMode0Height());
         SetCurrentModeIndex(0, GetCurrentModeIndex(0));
     }
 
