@@ -46,6 +46,7 @@ typedef struct _VIOGPU_ESCAPE
 {
     USHORT Type;
     USHORT DataLength;
+    USHORT ScanId; // target head for GET/SET_CUSTOM_RESOLUTION (VidPnSourceId); 0 for GET_DEVICE_ID
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
