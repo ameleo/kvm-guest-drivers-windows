@@ -68,8 +68,9 @@ extern "C"
 #include "trace.h"
 }
 
-#define MAX_CHILDREN                       1
-#define MAX_VIEWS                          1
+#define MAX_SCANOUTS                       8
+#define MAX_CHILDREN                       MAX_SCANOUTS
+#define MAX_VIEWS                          MAX_SCANOUTS
 #define BITS_PER_BYTE                      8
 
 #define POINTER_SIZE                       64
