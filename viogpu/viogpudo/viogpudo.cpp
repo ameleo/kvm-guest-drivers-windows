@@ -3333,6 +3333,18 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             if (m_pVioGpuDod->IsDriverActive())
             {
                 UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates hotplug
+                if (!wantConnected)
+                {
+                    // Phase 2b: on disconnect, release the scanout on the host
+                    // (DestroyFrameBufferObj with bReset=TRUE issues SetScanout(i,0)
+                    // and drops the resource). QEMU can then destroy the scanout's
+                    // DisplayChannel surface -> the server's capture skips it -> RTP
+                    // goes silent (no frozen heartbeat for a head that is gone). On
+                    // reconnect, CreateFrameBufferObj sets a fresh scanout. Present
+                    // to this head is guarded (m_pFrameBuf[i] == NULL -> no-op).
+                    DestroyFrameBufferObj(TRUE, FALSE, i);
+                    DbgPrint(TRACE_LEVEL_FATAL, ("scanout %u released (hotplug-out)\n", i));
+                }
             }
             else
             {
