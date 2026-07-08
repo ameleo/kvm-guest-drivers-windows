@@ -31,8 +31,8 @@
 
 GpuAdapter::GpuAdapter(const std::wstring LinkName)
     : m_hThread(NULL), m_hStopEvent(NULL), m_hResolutionEvent(NULL), m_hDC(NULL), m_hAdapter(NULL), m_Index(-1),
-      m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL), m_pDisplayModeInfo(NULL),
-      m_Flag(None)
+      m_DeviceId(0), m_SourceId(0), m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL),
+      m_pDisplayModeInfo(NULL), m_Flag(None)
 {
     m_DeviceName = LinkName;
     PrintMessage(L"%ws %ws\n", __FUNCTIONW__, m_DeviceName.c_str());
@@ -139,12 +139,28 @@ void GpuAdapter::Init()
     {
         UpdateDisplayConfig();
         m_hAdapter = openAdapter.hAdapter;
+        // This is the head (VidPnSourceId) this \\.\DISPLAYn maps to. Used to
+        // target the right head for the custom resolution and the display path.
+        m_SourceId = openAdapter.VidPnSourceId;
         if (QueryAdapterId())
         {
+            // This source's own auto-reset event: it stays signaled until this thread waits, so a change that
+            // comes while SyncResolution runs is not lost. A driver older than this agent has none: fall back to
+            // the adapter-wide pulse.
             std::wstring EventName = GLOBAL_OBJECTS;
-            EventName += RESOLUTION_EVENT_NAME;
-            EventName += std::to_wstring(m_Index);
-            m_hResolutionEvent = ::OpenEvent(EVENT_ALL_ACCESS | EVENT_MODIFY_STATE, FALSE, EventName.c_str());
+            EventName += RESOLUTION_HEAD_EVENT_NAME;
+            EventName += std::to_wstring(m_DeviceId);
+            EventName += L"_";
+            EventName += std::to_wstring(m_SourceId);
+            m_hResolutionEvent = ::OpenEvent(SYNCHRONIZE, FALSE, EventName.c_str());
+            if (m_hResolutionEvent == NULL)
+            {
+                PrintMessage(L"No per-source event %ws (%d), using the adapter event.\n", EventName.c_str(), GetLastError());
+                EventName = GLOBAL_OBJECTS;
+                EventName += RESOLUTION_EVENT_NAME;
+                EventName += std::to_wstring(m_DeviceId);
+                m_hResolutionEvent = ::OpenEvent(EVENT_ALL_ACCESS | EVENT_MODIFY_STATE, FALSE, EventName.c_str());
+            }
             if (m_hResolutionEvent == NULL)
             {
                 PrintMessage(L"Cannot open event %ws Error = %d.\n", EventName.c_str(), GetLastError());
@@ -183,7 +199,10 @@ bool GpuAdapter::QueryAdapterId()
         }
         else
         {
-            m_Index = data.Id;
+            // Device id is shared by all heads of this single adapter; keep it only
+            // for the (per-device) resolution event name. Do NOT overwrite m_Index,
+            // which UpdateDisplayConfig already set to this display's path index.
+            m_DeviceId = data.Id;
             return true;
         }
     }
@@ -213,6 +232,7 @@ bool GpuAdapter::GetCustomResolution(PVIOGPU_DISP_MODE pmode)
         VIOGPU_ESCAPE data{0};
         data.DataLength = sizeof(VIOGPU_DISP_MODE);
         data.Type = VIOGPU_GET_CUSTOM_RESOLUTION;
+        data.ScanId = (USHORT)m_SourceId;
 
         D3DKMT_ESCAPE escape = {0};
         escape.hAdapter = m_hAdapter;
@@ -236,29 +256,98 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
-    int ix = m_pDisplayPathInfo[m_Index].sourceInfo.modeInfoIdx;
-    PrintMessage(L"%ws m_Index %d %d (%dx%d)\n", __FUNCTIONW__, m_Index, ix, mode->XResolution, mode->YResolution);
-    m_pDisplayModeInfo[ix].sourceMode.width = mode->XResolution;
-    m_pDisplayModeInfo[ix].sourceMode.height = mode->YResolution;
-    SetDisplayConfig(m_PathArrayElements,
-                     m_pDisplayPathInfo,
-                     m_ModeInfoArrayElements,
-                     m_pDisplayModeInfo,
-                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
-    return true;
+    // Guard the path index. m_Index is -1 until UpdateDisplayConfig FINDS this display by GDI name; if the query
+    // failed or the device is transiently absent (mid-hotplug), m_Index stays -1/stale and m_pDisplayPathInfo may
+    // be NULL or smaller → out-of-bounds / NULL deref → agent crash.
+    // m_Index is ULONG, initialised to (ULONG)-1 = 0xffffffff and only set when UpdateDisplayConfig FINDS this
+    // display by GDI name. A single >= bound catches BOTH the never-found/stale sentinel and any out-of-range
+    // index (query failed / device transiently absent mid-hotplug) → avoids the OOB / NULL-deref crash.
+    if (!m_pDisplayPathInfo || m_Index >= m_PathArrayElements)
+    {
+        PrintMessage(L"%ws: invalid path index %u (paths=%u) - skip\n", __FUNCTIONW__, m_Index, m_PathArrayElements);
+        return false;
+    }
+
+    // Only resize a path Windows has ACTIVATED. An inactive path (single/transient) must not be forced here.
+    if (!(m_pDisplayPathInfo[m_Index].flags & DISPLAYCONFIG_PATH_ACTIVE))
+    {
+        PrintMessage(L"%ws: path %u not active - skip\n", __FUNCTIONW__, m_Index);
+        return false;
+    }
+
+    // Change ONLY this display's mode, via ChangeDisplaySettingsEx — do NOT re-apply the full CCD config
+    // (SDC_USE_SUPPLIED_DISPLAY_CONFIG). Re-applying the whole topology re-imposes a possibly-STALE snapshot of the
+    // OTHER heads' active/inactive state: e.g. head 0's instance, having queried during the transient single
+    // phase, would deactivate head 1 the moment after Windows extended it → the "revert to single" on re-extend.
+    // CDSEx touches only m_DeviceName's resolution and leaves the topology (which displays are active, positions)
+    // untouched — so persisting it is SAFE (unlike a full-topology SetDisplayConfig+SDC_SAVE_TO_DATABASE, which
+    // restored a stale FULL snapshot and bounced sizes). CDS_UPDATEREGISTRY writes this head's mode to the CCD-backed
+    // store so that on the next topology change (dual->mono) Windows restores THIS size directly, instead of a stale
+    // nominal one it then has to be corrected from → the residual dual->mono flash self-heals.
+    DEVMODE dm = {0};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettings(m_DeviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm))
+    {
+        PrintMessage(L"%ws: EnumDisplaySettings failed for %ws\n", __FUNCTIONW__, m_DeviceName.c_str());
+        return false;
+    }
+    if (dm.dmPelsWidth == mode->XResolution && dm.dmPelsHeight == mode->YResolution)
+    {
+        return true;   // already at this size (belt-and-suspenders on top of SyncResolution's compare)
+    }
+    dm.dmPelsWidth = mode->XResolution;
+    dm.dmPelsHeight = mode->YResolution;
+    dm.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
+    LONG r = ChangeDisplaySettingsEx(m_DeviceName.c_str(), &dm, NULL, CDS_UPDATEREGISTRY, NULL);
+    return (r == DISP_CHANGE_SUCCESSFUL);
 }
 
 void GpuAdapter::SyncResolution(void)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
+    // Serialize across the per-display agent instances. SetDisplayConfig applies
+    // the FULL topology, so two instances resizing concurrently would each push a
+    // stale snapshot and clobber the other head. Holding one lock while we
+    // re-query the current config and change only our own path keeps the other
+    // head stable when both instances update concurrently.
+    HANDLE hLock = CreateMutex(NULL, FALSE, L"VioGpuResizeLock");
+    BOOL owned = FALSE;
+    if (hLock)
+    {
+        // WAIT_ABANDONED also hands us the mutex (its previous owner died). On a timeout we go on unserialized,
+        // as before, but must not release a mutex we do not own.
+        DWORD wait = WaitForSingleObject(hLock, 5000);
+        owned = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
+        if (!owned)
+        {
+            PrintMessage(L"%ws: resize lock not taken (%lu), going on without it\n", __FUNCTIONW__, wait);
+        }
+    }
+
     VIOGPU_DISP_MODE custom = {0};
     UpdateDisplayConfig();
-    if (GetCustomResolution(&custom))
+    if (GetCustomResolution(&custom) && custom.XResolution && custom.YResolution)
     {
         VIOGPU_DISP_MODE current = {0};
         GetCurrentResolution(&current);
-        SetResolution(&custom);
+        // Apply ONLY when the requested size actually differs from what is already applied: SetResolution
+        // re-applies the FULL topology via SetDisplayConfig, which itself fires another resolution event, so a
+        // blind re-apply on every event would feed back into itself and fight Windows' own topology handling.
+        // Skipping the no-op re-apply breaks that loop while still following genuine client resizes.
+        if (custom.XResolution != current.XResolution || custom.YResolution != current.YResolution)
+        {
+            SetResolution(&custom);
+        }
+    }
+
+    if (hLock)
+    {
+        if (owned)
+        {
+            ReleaseMutex(hLock);
+        }
+        CloseHandle(hLock);
     }
 }
 
@@ -273,9 +362,12 @@ void GpuAdapter::Run()
         const HANDLE handles[] = {m_hStopEvent, m_hResolutionEvent};
         while (1)
         {
+            // The resolution event is a driver-side NOTIFICATION event (IoCreateNotificationEvent), signalled
+            // via KeSetEvent, which releases ALL waiters at once, so both heads' threads wake on every signal
+            // with no miss. Wait INFINITE, no polling needed.
             if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0)
             {
-                break;
+                break;   // stop event
             }
             SyncResolution();
         }
