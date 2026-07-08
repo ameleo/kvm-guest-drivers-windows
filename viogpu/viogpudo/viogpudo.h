@@ -160,6 +160,10 @@ class VioGpuAdapter : IVioGpuPCI
     }
     PBYTE GetEdidData(UINT scanId = 0);
     PBYTE GetCTA861Data(void);
+    BOOLEAN IsChildConnected(UINT childUid)
+    {
+        return (childUid < MAX_SCANOUTS) ? m_bConnected[childUid] : FALSE;
+    }
 
   protected:
   private:
@@ -174,7 +178,7 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN GetEdids(void);
     int AddEdidModes(void);
     BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
-    NTSTATUS UpdateChildStatus(BOOLEAN connect);
+    NTSTATUS UpdateChildStatus(UINT childUid, BOOLEAN connect);
     void SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ USHORT yres);
     BOOLEAN CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode, UINT scanId);
     void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId);
@@ -199,6 +203,7 @@ class VioGpuAdapter : IVioGpuPCI
     ULONG m_Id;
     BYTE m_EDIDs[MAX_SCANOUTS][EDID_RAW_BLOCK_SIZE];
     BOOLEAN m_bEDID[MAX_SCANOUTS];
+    BOOLEAN m_bConnected[MAX_SCANOUTS];   // per-scanout hotplug connected state (child status)
 
     VirtIODevice m_VioDev;
     CPciResources m_PciResources;
