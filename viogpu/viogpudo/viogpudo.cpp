@@ -412,7 +412,11 @@ NTSTATUS VioGpuDod::QueryChildStatus(_Inout_ DXGK_CHILD_STATUS *pChildStatus, _I
     {
         case StatusConnection:
             {
-                pChildStatus->HotPlug.Connected = IsDriverActive();
+                // Per-child connected state (hotplug). m_pHWDevice tracks each
+                // scanout's state; a child is connected only while the driver is
+                // active AND its scanout is marked connected.
+                pChildStatus->HotPlug.Connected =
+                    IsDriverActive() && m_pHWDevice && m_pHWDevice->IsChildConnected(pChildStatus->ChildUid);
                 return STATUS_SUCCESS;
             }
 
@@ -2368,6 +2372,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     RtlZeroMemory(m_CustomModeIndex, sizeof(m_CustomModeIndex));
     RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
     RtlZeroMemory(m_bEDID, sizeof(m_bEDID));
+    RtlZeroMemory(m_bConnected, sizeof(m_bConnected));
     m_ModeInfo = NULL;
     m_ModeCount = 0;
     m_Id = g_InstanceId++;
@@ -2788,6 +2793,17 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     // post-display); the secondary scanouts always use system memory (pass a zero
     // PA so VioGpuMemSegment::Init allocates a backing buffer).
     ULONG numScanouts = GetNumScanouts();
+
+    // Hotplug initial state: the PRIMARY (scanout 0) is always connected (VGA /
+    // post-display, never removed). Secondary heads start DISCONNECTED and
+    // hotplug in when the host enables them (pmodes[i].enabled, driven from
+    // GetDisplayInfo). The initial GetDisplayInfo below refines this before the
+    // driver is "started" (so QueryChildStatus is already correct at Start).
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        m_bConnected[scan] = (scan == 0);
+    }
+
     for (UINT scan = 1; scan < numScanouts; scan++)
     {
         PHYSICAL_ADDRESS sys_pa = {0};
@@ -3303,6 +3319,26 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             SetCustomDisplay(i, (USHORT)xres, (USHORT)yres);
             any = TRUE;
         }
+
+        // Hotplug (Option A): a head follows the host's pmodes[i].enabled. The
+        // primary (scanout 0) stays connected (VGA/post-display, never removed);
+        // secondaries connect when the host gives them a size and disconnect when
+        // it drops them. Once the driver is started, tell dxgkrnl (which re-queries
+        // and adds/removes the monitor); during StartDevice just latch the state so
+        // the first QueryChildStatus is already correct (indicating mid-Start is
+        // illegal).
+        BOOLEAN wantConnected = (i == 0) ? TRUE : (ok && xres && yres);
+        if (wantConnected != m_bConnected[i])
+        {
+            if (m_pVioGpuDod->IsDriverActive())
+            {
+                UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates hotplug
+            }
+            else
+            {
+                m_bConnected[i] = wantConnected;        // Start time: latch only, no indicate
+            }
+        }
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -3645,18 +3681,27 @@ void VioGpuAdapter::SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo)
     pMode->ScreenStride = (pModeInfo->XResolution * 4 + 3) & ~0x3;
 }
 
-NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
+NTSTATUS VioGpuAdapter::UpdateChildStatus(UINT childUid, BOOLEAN connect)
 {
     PAGED_CODE();
     NTSTATUS Status(STATUS_SUCCESS);
     DXGK_CHILD_STATUS ChildStatus;
     PDXGKRNL_INTERFACE pDXGKInterface(m_pVioGpuDod->GetDxgkInterface());
 
-    RtlZeroMemory(&ChildStatus, sizeof(ChildStatus));
+    if (childUid >= MAX_SCANOUTS)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
 
+    // Remember the state QueryChildStatus will report for this child, then tell
+    // dxgkrnl the monitor on this target connected/disconnected.
+    m_bConnected[childUid] = connect;
+
+    RtlZeroMemory(&ChildStatus, sizeof(ChildStatus));
     ChildStatus.Type = StatusConnection;
-    ChildStatus.ChildUid = 0;
+    ChildStatus.ChildUid = childUid;
     ChildStatus.HotPlug.Connected = connect;
+    DbgPrint(TRACE_LEVEL_FATAL, ("UpdateChildStatus child %u connect=%d\n", childUid, connect));
     Status = pDXGKInterface->DxgkCbIndicateChildStatus(pDXGKInterface->DeviceHandle, &ChildStatus);
     if (Status != STATUS_SUCCESS)
     {
@@ -3943,9 +3988,8 @@ void VioGpuAdapter::ConfigChanged(void)
         GetDisplayInfo();
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(m_u32NumScanouts));
-        //        UpdateChildStatus(FALSE);
-        //        ProcessEdid();
-        UpdateChildStatus(TRUE);
+        // GetDisplayInfo() above now drives per-scanout hotplug (connect/disconnect
+        // from pmodes[i].enabled) via UpdateChildStatus — nothing else to do here.
     }
 }
 
