@@ -134,8 +134,11 @@ NTSTATUS VioGpuDod::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
         RtlCopyMemory(&m_DxgkInterface, pDxgkInterface, pDxgkInterface->Size);
     }
 
-    RtlZeroMemory(&m_CurrentMode, sizeof(m_CurrentMode));
-    m_CurrentMode.DispInfo.TargetId = D3DDDI_ID_UNINITIALIZED;
+    RtlZeroMemory(m_CurrentMode, sizeof(m_CurrentMode));
+    for (UINT i = 0; i < MAX_VIEWS; i++)
+    {
+        m_CurrentMode[i].DispInfo.TargetId = D3DDDI_ID_UNINITIALIZED;
+    }
 
     Status = m_DxgkInterface.DxgkCbGetDeviceInformation(m_DxgkInterface.DeviceHandle, &m_DeviceInfo);
     if (!NT_SUCCESS(Status))
@@ -161,15 +164,15 @@ NTSTATUS VioGpuDod::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
         DbgPrint(TRACE_LEVEL_WARNING, ("GetRegisterInfo failed with status 0x%X\n", Status));
     }
 
-    Status = m_pHWDevice->HWInit(m_DeviceInfo.TranslatedResourceList, &m_CurrentMode.DispInfo);
+    Status = m_pHWDevice->HWInit(m_DeviceInfo.TranslatedResourceList, &m_CurrentMode[0].DispInfo);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("HWInit failed with status 0x%X\n", Status));
         return Status;
     }
 
-    m_CurrentMode.RamFrameBuffer = m_pHWDevice->GetPciResources()[0].GetMappedAddress(0, 0);
-    if (!m_CurrentMode.RamFrameBuffer)
+    m_CurrentMode[0].RamFrameBuffer = m_pHWDevice->GetPciResources()[0].GetMappedAddress(0, 0);
+    if (!m_CurrentMode[0].RamFrameBuffer)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("Failed to map RamFrameBuffer for VGA mode"));
     }
@@ -216,22 +219,34 @@ NTSTATUS VioGpuDod::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
         }
     }
 
-    m_CurrentMode.DispInfo.Width = max(MIN_WIDTH_SIZE, m_SystemDisplayInfo.Width);
-    m_CurrentMode.DispInfo.Height = max(MIN_HEIGHT_SIZE, m_SystemDisplayInfo.Height);
-    m_CurrentMode.DispInfo.ColorFormat = D3DDDIFMT_X8R8G8B8;
-    m_CurrentMode.DispInfo.Pitch = (BPPFromPixelFormat(m_CurrentMode.DispInfo.ColorFormat) / BITS_PER_BYTE) *
-                                   m_CurrentMode.DispInfo.Width;
-    m_CurrentMode.DispInfo.TargetId = 0;
-    if (m_CurrentMode.DispInfo.PhysicAddress.QuadPart == 0LL && m_SystemDisplayInfo.PhysicAddress.QuadPart != 0LL)
+    ULONG numScanouts = m_pHWDevice->GetNumScanouts();
+    // Seed only the active scanouts. Leave phantom sources' TargetId at
+    // D3DDDI_ID_UNINITIALIZED (set above) so we never advertise sources Windows
+    // does not know about.
+    for (UINT i = 0; i < numScanouts; i++)
     {
-        m_CurrentMode.DispInfo.PhysicAddress = m_SystemDisplayInfo.PhysicAddress;
+        m_CurrentMode[i].DispInfo.Width = max(MIN_WIDTH_SIZE, m_SystemDisplayInfo.Width);
+        m_CurrentMode[i].DispInfo.Height = max(MIN_HEIGHT_SIZE, m_SystemDisplayInfo.Height);
+        m_CurrentMode[i].DispInfo.ColorFormat = D3DDDIFMT_X8R8G8B8;
+        m_CurrentMode[i].DispInfo.Pitch = (BPPFromPixelFormat(m_CurrentMode[i].DispInfo.ColorFormat) / BITS_PER_BYTE) *
+                                          m_CurrentMode[i].DispInfo.Width;
+        m_CurrentMode[i].DispInfo.TargetId = i;
+        if (i == 0 && m_CurrentMode[i].DispInfo.PhysicAddress.QuadPart == 0LL &&
+            m_SystemDisplayInfo.PhysicAddress.QuadPart != 0LL)
+        {
+            m_CurrentMode[i].DispInfo.PhysicAddress = m_SystemDisplayInfo.PhysicAddress;
+        }
     }
 
-    DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentMode.DispInfo.ColorFormat));
+    DbgPrint(TRACE_LEVEL_INFORMATION,
+             ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentMode[0].DispInfo.ColorFormat));
 
-    *pNumberOfViews = MAX_VIEWS;
-    *pNumberOfChildren = MAX_CHILDREN;
+    *pNumberOfViews = numScanouts;
+    *pNumberOfChildren = numScanouts;
     m_Flags.DriverStarted = TRUE;
+    // The one-shot post-start scan is triggered from the FIRST CommitVidPn (see TriggerInitialScan), not here:
+    // DxgkCbIndicateChildStatus is illegal during StartDevice, and CommitVidPn is the point where Windows has
+    // actually composed its boot topology -- the right moment to indicate the secondary arrival so it extends.
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return STATUS_SUCCESS;
 }
@@ -353,7 +368,7 @@ NTSTATUS VioGpuDod::SetPowerState(_In_ ULONG HardwareUid,
             m_AdapterPowerState = DevicePowerState;
         }
 
-        Status = m_pHWDevice->SetPowerState(&m_DeviceInfo, DevicePowerState, &m_CurrentMode);
+        Status = m_pHWDevice->SetPowerState(&m_DeviceInfo, DevicePowerState, &m_CurrentMode[0]);
         return Status;
     }
     return STATUS_SUCCESS;
@@ -372,11 +387,17 @@ NTSTATUS VioGpuDod::QueryChildRelations(_Out_writes_bytes_(ChildRelationsSize) D
 
     for (UINT ChildIndex = 0; ChildIndex < ChildRelationsCount; ++ChildIndex)
     {
+        // Only the PRIMARY (scanout 0) is the VGA post-display output → always-connected / internal panel. The
+        // SECONDARY heads are HOTPLUGGABLE: report them Interruptible + external (HD15) so Windows HONORS their
+        // QueryChildStatus (connect/disconnect from m_bConnected). Reporting AlwaysConnected/INTERNAL for a
+        // secondary made Windows treat it as a soldered panel and IGNORE QueryChildStatus entirely — so it stayed
+        // connected regardless of GET_DISPLAY_INFO enabled=0 and a refused EDID → phantom 2nd monitor at boot.
+        BOOLEAN primaryVga = (ChildIndex == 0) && IsVgaDevice();
         pChildRelations[ChildIndex].ChildDeviceType = TypeVideoOutput;
-        pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = IsVgaDevice() ? HpdAwarenessAlwaysConnected
-                                                                                   : HpdAwarenessInterruptible;
-        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = IsVgaDevice() ? D3DKMDT_VOT_INTERNAL
-                                                                                                           : D3DKMDT_VOT_HD15;
+        pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = primaryVga ? HpdAwarenessAlwaysConnected
+                                                                                : HpdAwarenessInterruptible;
+        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = primaryVga ? D3DKMDT_VOT_INTERNAL
+                                                                                                        : D3DKMDT_VOT_HD15;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
         pChildRelations[ChildIndex].AcpiUid = 0;
@@ -400,7 +421,11 @@ NTSTATUS VioGpuDod::QueryChildStatus(_Inout_ DXGK_CHILD_STATUS *pChildStatus, _I
     {
         case StatusConnection:
             {
-                pChildStatus->HotPlug.Connected = IsDriverActive();
+                // Per-child connected state (hotplug). m_pHWDevice tracks each
+                // scanout's state; a child is connected only while the driver is
+                // active AND its scanout is marked connected.
+                pChildStatus->HotPlug.Connected =
+                    IsDriverActive() && m_pHWDevice && m_pHWDevice->IsChildConnected(pChildStatus->ChildUid);
                 return STATUS_SUCCESS;
             }
 
@@ -428,7 +453,7 @@ NTSTATUS VioGpuDod::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_DEVI
     VIOGPU_ASSERT(ChildUid < MAX_CHILDREN);
     PBYTE edid = NULL;
 
-    edid = m_pHWDevice->GetEdidData();
+    edid = m_pHWDevice->GetEdidData(ChildUid);
 
     if (!edid)
     {
@@ -510,9 +535,9 @@ NTSTATUS VioGpuDod::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pS
 
     VIOGPU_ASSERT(pSetPointerPosition != NULL);
     VIOGPU_ASSERT(pSetPointerPosition->VidPnSourceId < MAX_VIEWS);
-    if (IsPointerEnabled() && pSetPointerPosition->VidPnSourceId == 0)
+    if (IsPointerEnabled() && pSetPointerPosition->VidPnSourceId < m_pHWDevice->GetNumScanouts())
     {
-        return m_pHWDevice->SetPointerPosition(pSetPointerPosition, &m_CurrentMode);
+        return m_pHWDevice->SetPointerPosition(pSetPointerPosition, &m_CurrentMode[pSetPointerPosition->VidPnSourceId]);
     }
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -531,9 +556,9 @@ NTSTATUS VioGpuDod::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
               pSetPointerShape->XHot,
               pSetPointerShape->YHot,
               pSetPointerShape->VidPnSourceId));
-    if (IsPointerEnabled() && pSetPointerShape->VidPnSourceId == 0)
+    if (IsPointerEnabled() && pSetPointerShape->VidPnSourceId < m_pHWDevice->GetNumScanouts())
     {
-        return m_pHWDevice->SetPointerShape(pSetPointerShape, &m_CurrentMode);
+        return m_pHWDevice->SetPointerShape(pSetPointerShape, &m_CurrentMode[pSetPointerShape->VidPnSourceId]);
     }
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -558,7 +583,8 @@ NTSTATUS VioGpuDod::PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY *p
     VIOGPU_ASSERT(pPresentDisplayOnly != NULL);
     VIOGPU_ASSERT(pPresentDisplayOnly->VidPnSourceId < MAX_VIEWS);
 
-    if (pPresentDisplayOnly->BytesPerPixel < 4 || pPresentDisplayOnly->VidPnSourceId != 0)
+    UINT srcId = pPresentDisplayOnly->VidPnSourceId;
+    if (pPresentDisplayOnly->BytesPerPixel < 4 || srcId >= m_pHWDevice->GetNumScanouts())
     {
         DbgPrint(TRACE_LEVEL_ERROR,
                  ("pPresentDisplayOnly->BytesPerPixel is 0x%d, which is lower than the allowed.\n",
@@ -566,26 +592,28 @@ NTSTATUS VioGpuDod::PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY *p
         return STATUS_INVALID_PARAMETER;
     }
 
-    if ((m_MonitorPowerState > PowerDeviceD0) || (m_CurrentMode.Flags.SourceNotVisible))
+    CURRENT_MODE *pMode = &m_CurrentMode[srcId];
+
+    if ((m_MonitorPowerState > PowerDeviceD0) || (pMode->Flags.SourceNotVisible))
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Source is not visiable\n", __FUNCTION__));
         return STATUS_SUCCESS;
     }
 
-    if (!m_CurrentMode.Flags.FrameBufferIsActive)
+    if (!pMode->Flags.FrameBufferIsActive)
     {
         DbgPrint(TRACE_LEVEL_WARNING, ("<--- %s Frame Buffer is Not active\n", __FUNCTION__));
         return STATUS_UNSUCCESSFUL;
     }
 
-    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION RotationNeededByFb = pPresentDisplayOnly->Flags.Rotate ? m_CurrentMode.Rotation
+    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION RotationNeededByFb = pPresentDisplayOnly->Flags.Rotate ? pMode->Rotation
                                                                                                : D3DKMDT_VPPR_IDENTITY;
-    BYTE *pDst = (BYTE *)m_CurrentMode.FrameBuffer;
-    UINT DstBitPerPixel = BPPFromPixelFormat(m_CurrentMode.DispInfo.ColorFormat);
-    if (m_CurrentMode.Scaling == D3DKMDT_VPPS_CENTERED)
+    BYTE *pDst = (BYTE *)pMode->FrameBuffer;
+    UINT DstBitPerPixel = BPPFromPixelFormat(pMode->DispInfo.ColorFormat);
+    if (pMode->Scaling == D3DKMDT_VPPS_CENTERED)
     {
-        UINT CenterShift = (m_CurrentMode.DispInfo.Height - m_CurrentMode.SrcModeHeight) * m_CurrentMode.DispInfo.Pitch;
-        CenterShift += (m_CurrentMode.DispInfo.Width - m_CurrentMode.SrcModeWidth) * DstBitPerPixel / 8;
+        UINT CenterShift = (pMode->DispInfo.Height - pMode->SrcModeHeight) * pMode->DispInfo.Pitch;
+        CenterShift += (pMode->DispInfo.Width - pMode->SrcModeWidth) * DstBitPerPixel / 8;
         pDst += (int)CenterShift / 2;
     }
     Status = m_pHWDevice->ExecutePresentDisplayOnly(pDst,
@@ -598,7 +626,7 @@ NTSTATUS VioGpuDod::PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY *p
                                                     pPresentDisplayOnly->NumDirtyRects,
                                                     pPresentDisplayOnly->pDirtyRect,
                                                     RotationNeededByFb,
-                                                    &m_CurrentMode);
+                                                    pMode);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return Status;
@@ -628,7 +656,8 @@ NTSTATUS VioGpuDod::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_P
         SetPowerState(TargetId, PowerDeviceD0, PowerActionNone);
     }
 
-    m_pHWDevice->BlackOutScreen(&m_CurrentMode);
+    UINT scanId = (TargetId < MAX_VIEWS) ? (UINT)TargetId : 0;
+    m_pHWDevice->BlackOutScreen(&m_CurrentMode[scanId]);
     DbgPrint(TRACE_LEVEL_FATAL,
              ("StopDeviceAndReleasePostDisplayOwnership Width = %d Height = %d Pitch = %d ColorFormat = %dn",
               m_SystemDisplayInfo.Width,
@@ -638,7 +667,7 @@ NTSTATUS VioGpuDod::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_P
 
     *pDisplayInfo = m_SystemDisplayInfo;
     pDisplayInfo->TargetId = TargetId;
-    pDisplayInfo->AcpiId = m_CurrentMode.DispInfo.AcpiId;
+    pDisplayInfo->AcpiId = m_CurrentMode[scanId].DispInfo.AcpiId;
     return StopDevice();
 }
 
@@ -707,7 +736,13 @@ NTSTATUS VioGpuDod::IsSupportedVidPn(_Inout_ DXGKARG_ISSUPPORTEDVIDPN *pIsSuppor
         return Status;
     }
 
-    for (D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId = 0; SourceId < MAX_VIEWS; ++SourceId)
+    // Only enumerate the sources Windows actually knows about (the number of
+    // active scanouts we reported at StartDevice). Iterating up to the array
+    // capacity MAX_VIEWS would query phantom sources that are not in the VidPN
+    // topology; dxgkrnl returns an error (not SOURCE_NOT_IN_TOPOLOGY) for those,
+    // which would make IsSupportedVidPn fail and the VidPN never commit.
+    ULONG numScanouts = m_pHWDevice->GetNumScanouts();
+    for (D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId = 0; SourceId < numScanouts; ++SourceId)
     {
         SIZE_T NumPathsFromSource = 0;
         Status = pVidPnTopologyInterface->pfnGetNumPathsFromSource(hVidPnTopology, SourceId, &NumPathsFromSource);
@@ -803,7 +838,6 @@ VioGpuDod::RecommendFunctionalVidPn(_In_ CONST DXGKARG_RECOMMENDFUNCTIONALVIDPN 
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
     VIOGPU_ASSERT(pRecommendFunctionalVidPn == NULL);
 
@@ -814,7 +848,6 @@ NTSTATUS VioGpuDod::RecommendVidPnTopology(_In_ CONST DXGKARG_RECOMMENDVIDPNTOPO
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
     VIOGPU_ASSERT(pRecommendVidPnTopology == NULL);
 
@@ -825,7 +858,6 @@ NTSTATUS VioGpuDod::RecommendMonitorModes(_In_ CONST DXGKARG_RECOMMENDMONITORMOD
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     return AddSingleMonitorMode(pRecommendMonitorModes);
 }
@@ -983,7 +1015,10 @@ NTSTATUS VioGpuDod::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMODE
         return Status;
     }
 
-    pVbeModeInfo = m_pHWDevice->GetModeInfo(m_pHWDevice->GetCurrentModeIndex());
+    UINT monScanId = (pRecommendMonitorModes->VideoPresentTargetId < MAX_SCANOUTS)
+                         ? (UINT)pRecommendMonitorModes->VideoPresentTargetId
+                         : 0;
+    pVbeModeInfo = m_pHWDevice->GetModeInfo(m_pHWDevice->GetCurrentModeIndex(monScanId));
 
     BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo);
 
@@ -1520,16 +1555,34 @@ NTSTATUS VioGpuDod::SetVidPnSourceVisibility(_In_ CONST DXGKARG_SETVIDPNSOURCEVI
     VIOGPU_ASSERT((pSetVidPnSourceVisibility->VidPnSourceId < MAX_VIEWS) ||
                   (pSetVidPnSourceVisibility->VidPnSourceId == D3DDDI_ID_ALL));
 
-    if (pSetVidPnSourceVisibility->Visible)
+    ULONG numScanouts = m_pHWDevice->GetNumScanouts();
+    UINT first = 0, last = 0;
+    if (pSetVidPnSourceVisibility->VidPnSourceId == D3DDDI_ID_ALL)
     {
-        m_CurrentMode.Flags.FullscreenPresent = TRUE;
+        first = 0;
+        last = numScanouts - 1;
     }
     else
     {
-        m_pHWDevice->BlackOutScreen(&m_CurrentMode);
+        if (pSetVidPnSourceVisibility->VidPnSourceId >= numScanouts)
+        {
+            return STATUS_SUCCESS;
+        }
+        first = last = pSetVidPnSourceVisibility->VidPnSourceId;
     }
 
-    m_CurrentMode.Flags.SourceNotVisible = !(pSetVidPnSourceVisibility->Visible);
+    for (UINT src = first; src <= last; src++)
+    {
+        if (pSetVidPnSourceVisibility->Visible)
+        {
+            m_CurrentMode[src].Flags.FullscreenPresent = TRUE;
+        }
+        else
+        {
+            m_pHWDevice->BlackOutScreen(&m_CurrentMode[src]);
+        }
+        m_CurrentMode[src].Flags.SourceNotVisible = !(pSetVidPnSourceVisibility->Visible);
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
@@ -1591,6 +1644,18 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
                   Status,
                   LONG_PTR(hVidPnTopology)));
         goto CommitVidPnExit;
+    }
+
+
+    // Windows has composed a real topology (the boot commit is single). Trigger the ONE-SHOT post-start scan so a
+    // secondary the host enabled at boot -- kept at the HWInit seed (disconnected) until now -- is indicated as a
+    // hotplug ARRIVAL, which makes Windows re-compose and EXTEND. This replaces a magic timer: it is tied to the
+    // real "Windows finished its boot topology" event, like the Linux driver drives reconfiguration from the
+    // display event. The trigger only SIGNALS the worker; the actual GetDisplayInfo / DxgkCbIndicateChildStatus
+    // runs there (PASSIVE), never re-entrantly from inside this DDI. One-shot guard lives in TriggerInitialScan.
+    if (NumPaths != 0 && m_pHWDevice)
+    {
+        m_pHWDevice->TriggerInitialScan();
     }
 
     if (NumPaths != 0)
@@ -1746,10 +1811,15 @@ NTSTATUS VioGpuDod::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourc
 
     NTSTATUS Status = STATUS_SUCCESS;
 
-    CURRENT_MODE *pCurrentMode = &m_CurrentMode;
+    UINT srcId = (UINT)pPath->VidPnSourceId;
+    UINT scanId = (pPath->VidPnTargetId < MAX_SCANOUTS) ? (UINT)pPath->VidPnTargetId : 0;
+    CURRENT_MODE *pCurrentMode = &m_CurrentMode[srcId];
+    pCurrentMode->DispInfo.TargetId = scanId;
     DbgPrint(TRACE_LEVEL_FATAL,
-             ("---> %s (%dx%d)\n",
+             ("---> %s src %d scan %d (%dx%d)\n",
               __FUNCTION__,
+              srcId,
+              scanId,
               pSourceMode->Format.Graphics.VisibleRegionSize.cx,
               pSourceMode->Format.Graphics.VisibleRegionSize.cy));
     pCurrentMode->Scaling = pPath->ContentTransformation.Scaling;
@@ -1771,10 +1841,10 @@ NTSTATUS VioGpuDod::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourc
             if (pCurrentMode->DispInfo.Width == pModeInfo->VisScreenWidth &&
                 pCurrentMode->DispInfo.Height == pModeInfo->VisScreenHeight)
             {
-                Status = m_pHWDevice->SetCurrentMode(m_pHWDevice->GetModeNumber(ModeIndex), pCurrentMode);
+                Status = m_pHWDevice->SetCurrentMode(m_pHWDevice->GetModeNumber(ModeIndex), pCurrentMode, scanId);
                 if (NT_SUCCESS(Status))
                 {
-                    m_pHWDevice->SetCurrentModeIndex(ModeIndex);
+                    m_pHWDevice->SetCurrentModeIndex(scanId, ModeIndex);
                 }
                 break;
             }
@@ -1886,7 +1956,7 @@ VioGpuDod::UpdateActiveVidPnPresentPath(_In_ CONST DXGKARG_UPDATEACTIVEVIDPNPRES
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     VIOGPU_ASSERT(pUpdateActiveVidPnPresentPath != NULL);
-    VIOGPU_ASSERT(pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.VidPnSourceId == 0);
+    VIOGPU_ASSERT(pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.VidPnSourceId < MAX_VIEWS);
 
     NTSTATUS Status = IsVidPnPathFieldsValid(&(pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo));
     if (!NT_SUCCESS(Status))
@@ -1894,9 +1964,15 @@ VioGpuDod::UpdateActiveVidPnPresentPath(_In_ CONST DXGKARG_UPDATEACTIVEVIDPNPRES
         return Status;
     }
 
-    m_CurrentMode.Flags.FullscreenPresent = TRUE;
+    UINT srcId = (UINT)pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.VidPnSourceId;
+    if (srcId >= m_pHWDevice->GetNumScanouts())
+    {
+        return STATUS_SUCCESS;
+    }
 
-    m_CurrentMode.Rotation = pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.ContentTransformation.Rotation;
+    m_CurrentMode[srcId].Flags.FullscreenPresent = TRUE;
+
+    m_CurrentMode[srcId].Rotation = pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.ContentTransformation.Rotation;
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
@@ -1952,21 +2028,21 @@ NTSTATUS VioGpuDod::SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID Targ
         return STATUS_UNSUCCESSFUL;
     }
 
-    m_CurrentMode.Flags.FrameBufferIsActive = FALSE;
+    m_CurrentMode[0].Flags.FrameBufferIsActive = FALSE;
     m_pHWDevice->ResetToVgaMode();
 
-    if (m_CurrentMode.RamFrameBuffer == nullptr)
+    if (m_CurrentMode[0].RamFrameBuffer == nullptr)
     {
         return STATUS_UNSUCCESSFUL;
     }
 
-    m_CurrentMode.FrameBuffer = m_CurrentMode.RamFrameBuffer;
-    m_CurrentMode.Flags.FrameBufferIsActive = TRUE;
-    m_CurrentMode.Rotation = D3DKMDT_VPPR_IDENTITY;
-    *pWidth = m_CurrentMode.DispInfo.Width = m_SystemDisplayInfo.Width;
-    *pHeight = m_CurrentMode.DispInfo.Height = m_SystemDisplayInfo.Height;
-    *pColorFormat = m_CurrentMode.DispInfo.ColorFormat = m_SystemDisplayInfo.ColorFormat;
-    m_CurrentMode.DispInfo.Pitch = m_SystemDisplayInfo.Pitch = (BPPFromPixelFormat(m_SystemDisplayInfo.ColorFormat) /
+    m_CurrentMode[0].FrameBuffer = m_CurrentMode[0].RamFrameBuffer;
+    m_CurrentMode[0].Flags.FrameBufferIsActive = TRUE;
+    m_CurrentMode[0].Rotation = D3DKMDT_VPPR_IDENTITY;
+    *pWidth = m_CurrentMode[0].DispInfo.Width = m_SystemDisplayInfo.Width;
+    *pHeight = m_CurrentMode[0].DispInfo.Height = m_SystemDisplayInfo.Height;
+    *pColorFormat = m_CurrentMode[0].DispInfo.ColorFormat = m_SystemDisplayInfo.ColorFormat;
+    m_CurrentMode[0].DispInfo.Pitch = m_SystemDisplayInfo.Pitch = (BPPFromPixelFormat(m_SystemDisplayInfo.ColorFormat) /
                                                                 BITS_PER_BYTE) *
                                                                m_SystemDisplayInfo.Width;
 
@@ -1982,7 +2058,7 @@ VOID VioGpuDod::SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride) 
                                    _In_ INT PositionX,
                                    _In_ INT PositionY)
 {
-    if (m_CurrentMode.Flags.FrameBufferIsActive)
+    if (m_CurrentMode[0].Flags.FrameBufferIsActive)
     {
         RECT Rect = {0};
         BLT_INFO SrcBltInfo = {0};
@@ -1993,14 +2069,14 @@ VOID VioGpuDod::SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride) 
         Rect.right = Rect.left + SourceWidth;
         Rect.bottom = Rect.top + SourceHeight;
 
-        DstBltInfo.pBits = m_CurrentMode.FrameBuffer;
-        DstBltInfo.Pitch = m_CurrentMode.DispInfo.Pitch;
-        DstBltInfo.BitsPerPel = BPPFromPixelFormat(m_CurrentMode.DispInfo.ColorFormat);
+        DstBltInfo.pBits = m_CurrentMode[0].FrameBuffer;
+        DstBltInfo.Pitch = m_CurrentMode[0].DispInfo.Pitch;
+        DstBltInfo.BitsPerPel = BPPFromPixelFormat(m_CurrentMode[0].DispInfo.ColorFormat);
         DstBltInfo.Offset.x = 0;
         DstBltInfo.Offset.y = 0;
-        DstBltInfo.Rotation = m_CurrentMode.Rotation;
-        DstBltInfo.Width = m_CurrentMode.DispInfo.Width;
-        DstBltInfo.Height = m_CurrentMode.DispInfo.Height;
+        DstBltInfo.Rotation = m_CurrentMode[0].Rotation;
+        DstBltInfo.Width = m_CurrentMode[0].DispInfo.Width;
+        DstBltInfo.Height = m_CurrentMode[0].DispInfo.Height;
 
         SrcBltInfo.pBits = pSource;
         SrcBltInfo.Pitch = SourceStride;
@@ -2310,14 +2386,17 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     PAGED_CODE();
     RtlZeroMemory(&m_VioDev, sizeof(m_VioDev));
     m_pVioGpuDod = pVioGpuDod;
-    m_CurrentModeIndex = 0;
-    m_CustomModeIndex = 0;
+    RtlZeroMemory(m_CurrentModeIndex, sizeof(m_CurrentModeIndex));
+    RtlZeroMemory(m_CustomModeIndex, sizeof(m_CustomModeIndex));
     RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
-    m_bEDID = FALSE;
+    RtlZeroMemory(m_bEDID, sizeof(m_bEDID));
+    RtlZeroMemory(m_bConnected, sizeof(m_bConnected));
     m_ModeInfo = NULL;
     m_ModeCount = 0;
     m_Id = g_InstanceId++;
-    m_pFrameBuf = NULL;
+    RtlZeroMemory(m_pFrameBuf, sizeof(m_pFrameBuf));
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+        KeInitializeGuardedMutex(&m_FrameBufLock[scan]);
     m_pCursorBuf = NULL;
     KeInitializeGuardedMutex(&m_CursorMutex);
     // No sprite is attached until the first shape is set.
@@ -2329,12 +2408,16 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_pWorkThread = NULL;
     m_ResolutionEvent = NULL;
     m_ResolutionEventHandle = NULL;
+    RtlZeroMemory(m_HeadResolutionEvent, sizeof(m_HeadResolutionEvent));
+    RtlZeroMemory(m_HeadResolutionEventHandle, sizeof(m_HeadResolutionEventHandle));
     m_u64HostFeatures = 0;
     m_u64GuestFeatures = 0;
     m_u32NumCapsets = 0;
     m_u32NumScanouts = 0;
 
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
+    m_InitialScanPending = 0;
+    m_bInitialScanArmed = FALSE;
 }
 
 VioGpuAdapter::~VioGpuAdapter(void)
@@ -2343,31 +2426,34 @@ VioGpuAdapter::~VioGpuAdapter(void)
     DbgPrint(TRACE_LEVEL_FATAL, ("---> %s 0x%p\n", __FUNCTION__, this));
     CloseResolutionEvent();
     DestroyCursor();
-    DestroyFrameBufferObj(TRUE, FALSE);
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        DestroyFrameBufferObj(TRUE, FALSE, scan);
+    }
     VioGpuAdapterClose();
     HWClose();
     delete[] m_ModeInfo;
     m_ModeInfo = NULL;
-    m_CurrentModeIndex = 0;
+    RtlZeroMemory(m_CurrentModeIndex, sizeof(m_CurrentModeIndex));
     m_ModeCount = 0;
     m_Id = 0;
     DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s\n", __FUNCTION__));
 }
 
-NTSTATUS VioGpuAdapter::SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode)
+NTSTATUS VioGpuAdapter::SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode, UINT scanId)
 {
     PAGED_CODE();
-    DbgPrint(TRACE_LEVEL_ERROR, ("---> %s - %d: Mode = %d\n", __FUNCTION__, m_Id, Mode));
+    DbgPrint(TRACE_LEVEL_ERROR, ("---> %s - %d: scan %d Mode = %d\n", __FUNCTION__, m_Id, scanId, Mode));
     for (ULONG idx = 0; idx < GetModeCount(); idx++)
     {
         if (Mode == m_ModeInfo[idx].ModeIndex /*m_ModeNumbers[idx]*/)
         {
             if (pCurrentMode->Flags.FrameBufferIsActive)
             {
-                DestroyFrameBufferObj(FALSE, FALSE);
+                DestroyFrameBufferObj(FALSE, FALSE, scanId);
                 pCurrentMode->Flags.FrameBufferIsActive = FALSE;
             }
-            if (CreateFrameBufferObj(&m_ModeInfo[idx], pCurrentMode))
+            if (CreateFrameBufferObj(&m_ModeInfo[idx], pCurrentMode, scanId))
             {
                 DbgPrint(TRACE_LEVEL_ERROR,
                          ("%s device %d: setting current mode %d (%d x %d)\n",
@@ -2487,7 +2573,13 @@ NTSTATUS VioGpuAdapter::SetPowerState(DXGK_DEVICE_INFO *pDeviceInfo,
         case PowerDeviceD2:
         case PowerDeviceD3:
             {
-                DestroyFrameBufferObj(TRUE, FALSE);
+                // Every head, not just the first: VioGpuAdapterClose resets the device, and a secondary left
+                // attached keeps its framebuffer object and size across the reset. On D0 its presents would then
+                // still pass the m_pFrameBuf guard and go to a resource the reset host no longer has.
+                for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+                {
+                    DestroyFrameBufferObj(TRUE, FALSE, scan);
+                }
                 VioGpuAdapterClose();
                 pCurrentMode->Flags.FrameBufferIsActive = FALSE;
                 pCurrentMode->FrameBuffer = NULL;
@@ -2520,23 +2612,27 @@ NTSTATUS VioGpuAdapter::VirtIoDeviceInit()
                                     m_PciResources.IsMSIEnabled());
 }
 
-PBYTE VioGpuAdapter::GetEdidData()
+PBYTE VioGpuAdapter::GetEdidData(UINT scanId)
 {
     PAGED_CODE();
 
-    return m_bEDID ? m_EDIDs : (PBYTE)(g_gpu_edid);
+    if (scanId >= MAX_SCANOUTS)
+    {
+        scanId = 0;
+    }
+    return m_bEDID[scanId] ? m_EDIDs[scanId] : (PBYTE)(g_gpu_edid);
 }
 
 PBYTE VioGpuAdapter::GetCTA861Data(void)
 {
     PAGED_CODE();
 
-    if (m_bEDID)
+    if (m_bEDID[0])
     {
-        PEDID_DATA_V1 edid_data = (PEDID_DATA_V1)m_EDIDs;
+        PEDID_DATA_V1 edid_data = (PEDID_DATA_V1)m_EDIDs[0];
         if (edid_data->ExtensionFlag[0])
         {
-            PEDID_CTA_861 cta_data = (PEDID_CTA_861)(m_EDIDs + EDID_V1_BLOCK_SIZE);
+            PEDID_CTA_861 cta_data = (PEDID_CTA_861)(m_EDIDs[0] + EDID_V1_BLOCK_SIZE);
             if (cta_data->ExtentionTag[0] >= 2 && cta_data->Revision[0] >= 3)
             {
                 return (PBYTE)cta_data;
@@ -2576,6 +2672,31 @@ VOID VioGpuAdapter::CreateResolutionEvent(VOID)
     }
     KeClearEvent(m_ResolutionEvent);
     ObReferenceObject(m_ResolutionEvent);
+
+    // The per-source auto-reset events of current agents (see RESOLUTION_HEAD_EVENT_NAME). A failure here only
+    // leaves those agents on the pulse.
+    for (UINT src = 0; src < MAX_SCANOUTS; src++)
+    {
+        DECLARE_UNICODE_STRING_SIZE(HeadEventName, 256);
+        status = RtlUnicodeStringPrintf(&HeadEventName,
+                                        L"%ws%ws%ws_%u",
+                                        BASE_NAMED_OBJECTS,
+                                        RESOLUTION_HEAD_EVENT_NAME,
+                                        DeviceNumber.Buffer,
+                                        src);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+        m_HeadResolutionEvent[src] = IoCreateSynchronizationEvent(&HeadEventName, &m_HeadResolutionEventHandle[src]);
+        if (m_HeadResolutionEvent[src] == NULL)
+        {
+            m_HeadResolutionEventHandle[src] = NULL;
+            break;
+        }
+        KeClearEvent(m_HeadResolutionEvent[src]);
+        ObReferenceObject(m_HeadResolutionEvent[src]);
+    }
 }
 
 VOID VioGpuAdapter::NotifyResolutionEvent(VOID)
@@ -2587,6 +2708,14 @@ VOID VioGpuAdapter::NotifyResolutionEvent(VOID)
         DbgPrint(TRACE_LEVEL_ERROR, ("NotifyResolutionEvent\n"));
         KeSetEvent(m_ResolutionEvent, IO_NO_INCREMENT, FALSE);
         KeClearEvent(m_ResolutionEvent);
+    }
+    // Left signaled: each source's agent thread consumes its own event when it next waits.
+    for (UINT src = 0; src < MAX_SCANOUTS; src++)
+    {
+        if (m_HeadResolutionEvent[src] != NULL)
+        {
+            KeSetEvent(m_HeadResolutionEvent[src], IO_NO_INCREMENT, FALSE);
+        }
     }
 }
 
@@ -2604,6 +2733,20 @@ VOID VioGpuAdapter::CloseResolutionEvent(VOID)
     {
         ObDereferenceObject(m_ResolutionEvent);
         m_ResolutionEvent = NULL;
+    }
+
+    for (UINT src = 0; src < MAX_SCANOUTS; src++)
+    {
+        if (m_HeadResolutionEventHandle[src] != NULL)
+        {
+            ZwClose(m_HeadResolutionEventHandle[src]);
+            m_HeadResolutionEventHandle[src] = NULL;
+        }
+        if (m_HeadResolutionEvent[src] != NULL)
+        {
+            ObDereferenceObject(m_HeadResolutionEvent[src]);
+            m_HeadResolutionEvent[src] = NULL;
+        }
     }
 }
 
@@ -2718,12 +2861,42 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
         fb_size = max(req_size, fb_size);
     }
 
-    if (!m_FrameSegment.Init(fb_size, &fb_pa))
+    if (!m_FrameSegment[0].Init(fb_size, &fb_pa))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("%s failed to allocate FB memory segment\n", __FUNCTION__));
         status = STATUS_INSUFFICIENT_RESOURCES;
         VioGpuDbgBreak();
         return status;
+    }
+
+    // Each active scanout needs its OWN framebuffer segment: VioGpuObj::Init does
+    // not sub-allocate, it just references the segment base, so two scanouts
+    // sharing one segment would overlap. Scanout 0 above may use the PCI BAR (VGA
+    // post-display); the secondary scanouts always use system memory (pass a zero
+    // PA so VioGpuMemSegment::Init allocates a backing buffer).
+    ULONG numScanouts = GetNumScanouts();
+
+    // Hotplug initial state: the PRIMARY (scanout 0) is always connected (VGA /
+    // post-display, never removed). Secondary heads start DISCONNECTED and
+    // hotplug in when the host enables them (pmodes[i].enabled, driven from
+    // GetDisplayInfo). The initial GetDisplayInfo below refines this before the
+    // driver is "started" (so QueryChildStatus is already correct at Start).
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        m_bConnected[scan] = (scan == 0);
+    }
+
+    for (UINT scan = 1; scan < numScanouts; scan++)
+    {
+        PHYSICAL_ADDRESS sys_pa = {0};
+        if (!m_FrameSegment[scan].Init(req_size, &sys_pa))
+        {
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s failed to allocate FB memory segment for scanout %u\n", __FUNCTION__, scan));
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            VioGpuDbgBreak();
+            return status;
+        }
     }
 
     if (!m_CursorSegment.Init(POINTER_SIZE * POINTER_SIZE * 4, NULL))
@@ -2757,7 +2930,10 @@ NTSTATUS VioGpuAdapter::HWClose(void)
 
     ObDereferenceObject(m_pWorkThread);
 
-    m_FrameSegment.Close();
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        m_FrameSegment[scan].Close();
+    }
     m_CursorSegment.Close();
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s\n", __FUNCTION__));
@@ -2904,7 +3080,22 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
     offset = (updrect.top * pModeCur->DispInfo.Pitch) +
              (updrect.left * ((DstBitPerPixel + BITS_PER_BYTE - 1) / BITS_PER_BYTE));
 
-    resid = m_pFrameBuf->GetId();
+    // Route the transfer/flush to the framebuffer of the scanout this source
+    // maps to (DispInfo.TargetId was set to scanId in SetSourceModeAndPath).
+    // Without this, presenting to a secondary head would flush scanout 0's
+    // resource -> the secondary head stays black.
+    UINT scanId = (pModeCur->DispInfo.TargetId < MAX_SCANOUTS) ? (UINT)pModeCur->DispInfo.TargetId : 0;
+    // Hold this scanout's lock across the deref + host transfer: a concurrent hotplug/mode/power writer must not
+    // delete the object (UAF on GetId) or DestroyResource/recycle its id mid-transfer. (The BltBits above wrote
+    // to the persistent segment memory, not the object, so it stays outside the lock.)
+    KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);
+    if (m_pFrameBuf[scanId] == NULL)
+    {
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
+        DbgPrint(TRACE_LEVEL_WARNING, ("present scanout %u has no framebuffer\n", scanId));
+        return STATUS_UNSUCCESSFUL;
+    }
+    resid = m_pFrameBuf[scanId]->GetId();
     DbgPrint(TRACE_LEVEL_VERBOSE,
              ("offset = %lu (XxYxWxH) (%dx%dx%dx%d) vs (%dx%dx%dx%d)\n",
               offset,
@@ -2924,6 +3115,7 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
                                  updrect.left,
                                  updrect.top);
     m_CtrlQueue.ResFlush(resid, updrect.right - updrect.left, updrect.bottom - updrect.top, updrect.left, updrect.top);
+    KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
 
     return STATUS_SUCCESS;
 }
@@ -2949,10 +3141,19 @@ VOID VioGpuAdapter::BlackOutScreen(CURRENT_MODE *pCurrentMod)
 
         // FIXME!!! rotation
 
-        resid = m_pFrameBuf->GetId();
+        UINT scanId = (pCurrentMod->DispInfo.TargetId < MAX_SCANOUTS) ? (UINT)pCurrentMod->DispInfo.TargetId : 0;
+        KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);   // same reader/writer race as ExecutePresentDisplayOnly
+        if (m_pFrameBuf[scanId] == NULL)
+        {
+            KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
+            DbgPrint(TRACE_LEVEL_WARNING, ("blackout scanout %u has no framebuffer\n", scanId));
+            return;
+        }
+        resid = m_pFrameBuf[scanId]->GetId();
 
         m_CtrlQueue.TransferToHost2D(resid, 0UL, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
         m_CtrlQueue.ResFlush(resid, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -2993,6 +3194,7 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
 
         crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
         crsr->resource_id = m_pCursorBuf->GetId();
+        crsr->pos.scanout_id = (ULONG)pSetPointerShape->VidPnSourceId; // source id == scanout id
         crsr->pos.x = 0;
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
@@ -3058,6 +3260,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             UINT ret = 0;
             crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
             RtlZeroMemory(crsr, sizeof(*crsr));
+            crsr->pos.scanout_id = (ULONG)pSetPointerPosition->VidPnSourceId;
 
             if (!visible)
             {
@@ -3113,14 +3316,30 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     UINT size = pEscape->PrivateDriverDataSize;
-    if (size < sizeof(PVIOGPU_ESCAPE))
+    // Two layouts reach this escape. The multi-head one (ScanId at offset 4, the union after it) is at least
+    // sizeof(VIOGPU_ESCAPE). The single-head one of upstream tools is 8 bytes, with the union at offset 4 and no
+    // ScanId: reading it as the multi-head layout would take the width for a head and touch 2 bytes past the
+    // caller's buffer. It is translated into a local request for head 0, and the answer copied back to its own
+    // offset when done.
+    VIOGPU_ESCAPE singleHeadRequest = {0};
+    PVIOGPU_ESCAPE_SINGLE_HEAD pSingleHead = NULL;
+    if (size < sizeof(VIOGPU_ESCAPE))
     {
-        DbgPrint(TRACE_LEVEL_ERROR,
-                 ("%s buffer too small %d, should be at least %d\n",
-                  __FUNCTION__,
-                  pEscape->PrivateDriverDataSize,
-                  size));
-        return STATUS_INVALID_BUFFER_SIZE;
+        if (size < sizeof(VIOGPU_ESCAPE_SINGLE_HEAD))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s buffer too small %d, should be at least %d\n",
+                      __FUNCTION__,
+                      size,
+                      (UINT)sizeof(VIOGPU_ESCAPE_SINGLE_HEAD)));
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        pSingleHead = (PVIOGPU_ESCAPE_SINGLE_HEAD)pEscape->pPrivateDriverData;
+        singleHeadRequest.Type = pSingleHead->Type;
+        singleHeadRequest.DataLength = pSingleHead->DataLength;
+        singleHeadRequest.ScanId = 0;
+        singleHeadRequest.Id = pSingleHead->Id;
+        pVioGpuEscape = &singleHeadRequest;
     }
 
     switch (pVioGpuEscape->Type)
@@ -3153,8 +3372,13 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                               size));
                     return STATUS_INVALID_BUFFER_SIZE;
                 }
-                pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex].VisScreenWidth;
-                pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex].VisScreenHeight;
+                {
+                    // Return the custom resolution of the head the caller asks for
+                    // (ScanId == VidPnSourceId, which equals the scanout in practice).
+                    UINT getScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenWidth;
+                    pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenHeight;
+                }
                 break;
             }
         case VIOGPU_SET_CUSTOM_RESOLUTION:
@@ -3185,11 +3409,18 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                           pVioGpuEscape->Resolution.XResolution,
                           pVioGpuEscape->Resolution.YResolution));
 
-                m_pVioGpuDod->SetPersistentDispMode0Width(pVioGpuEscape->Resolution.XResolution);
-                m_pVioGpuDod->SetPersistentDispMode0Height(pVioGpuEscape->Resolution.YResolution);
-                m_pVioGpuDod->SetRegisterConfigInfo();
-                SetCustomDisplay(pVioGpuEscape->Resolution.XResolution, pVioGpuEscape->Resolution.YResolution);
-                SetCurrentModeIndex(m_CurrentModeIndex);
+                {
+                    UINT setScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    // Only the primary head's custom resolution is persisted across boots.
+                    if (setScan == 0)
+                    {
+                        m_pVioGpuDod->SetPersistentDispMode0Width(pVioGpuEscape->Resolution.XResolution);
+                        m_pVioGpuDod->SetPersistentDispMode0Height(pVioGpuEscape->Resolution.YResolution);
+                        m_pVioGpuDod->SetRegisterConfigInfo();
+                    }
+                    SetCustomDisplay(setScan, pVioGpuEscape->Resolution.XResolution, pVioGpuEscape->Resolution.YResolution);
+                    SetCurrentModeIndex(0, GetCurrentModeIndex(0));
+                }
                 break;
             }
         default:
@@ -3197,6 +3428,10 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
             status = STATUS_INVALID_PARAMETER;
     }
 
+    if (pSingleHead != NULL && NT_SUCCESS(status))
+    {
+        pSingleHead->Id = singleHeadRequest.Id; // the answer (device id or resolution) at the caller's offset
+    }
     return status;
 }
 
@@ -3206,29 +3441,77 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
-    PGPU_VBUFFER vbuf = NULL;
-    ULONG xres = 0;
-    ULONG yres = 0;
+    ULONG numScanouts = GetNumScanouts();
+    BOOLEAN any = FALSE;
 
-    for (UINT32 i = 0; i < m_u32NumScanouts; i++)
+    // Read EACH scanout's host-preferred resolution into ITS OWN custom slot.
+    // Only overwrite a slot when the host actually reports a size for that
+    // scanout: clobbering a head that momentarily reports "disabled" with a
+    // nominal size would knock it back to 1024x768 on every config change.
+    for (UINT32 i = 0; i < numScanouts; i++)
     {
+        PGPU_VBUFFER vbuf = NULL;
+        ULONG xres = 0;
+        ULONG yres = 0;
+        BOOLEAN ok = FALSE;
+
         if (m_CtrlQueue.AskDisplayInfo(&vbuf))
         {
-            m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
+            ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
             m_CtrlQueue.ReleaseBuffer(vbuf);
-            if (xres && yres)
+        }
+
+
+        if (ok && xres && yres)
+        {
+            SetCustomDisplay(i, (USHORT)xres, (USHORT)yres);
+            // Point this head's CURRENT mode index at its CUSTOM slot (the host-preferred size) as soon as we
+            // learn the size — do NOT wait for a VidPN commit. Otherwise m_CurrentModeIndex[i] stays 0 for an
+            // uncommitted secondary, so RecommendMonitorModes/AddSingleMonitorMode advertises mode[0] (a small
+            // default) as this monitor's PREFERRED mode → Windows composes the extended layout wrong and falls
+            // back to "second screen only". That never commits head i → the index stays 0 → self-reinforcing
+            // random single/extend on re-extend. Seeding the correct preferred here breaks the cycle.
+            SetCurrentModeIndex(i, m_CustomModeIndex[i]);
+            any = TRUE;
+        }
+
+        // Hotplug (Option A): a head follows the host's pmodes[i].enabled. The
+        // primary (scanout 0) stays connected (VGA/post-display, never removed);
+        // secondaries connect when the host gives them a size and disconnect when
+        // it drops them. Once the driver is started, tell dxgkrnl (which re-queries
+        // and adds/removes the monitor); during StartDevice just latch the state so
+        // the first QueryChildStatus is already correct (indicating mid-Start is
+        // illegal).
+        BOOLEAN wantConnected = (i == 0) ? TRUE : (ok && xres && yres);
+        if (wantConnected != m_bConnected[i])
+        {
+            // The connection state changes ONLY through DxgkCbIndicateChildStatus, which is legal only once the
+            // driver is active. So pre-active (during boot) we do NOTHING here: the state stays at its HWInit seed
+            // (m_bConnected[scan] = (scan == 0)) -- primary connected, secondaries disconnected -- exactly the
+            // DRM/virtio-gpu init model (index 0 enabled, index > 0 starts disabled). Sizes were already read into
+            // the custom slots above. A secondary the host reports enabled is therefore delivered as a proper
+            // hotplug ARRIVAL once active (TriggerInitialScan re-runs this with IsDriverActive() -> UpdateChildStatus
+            // connect), which is what makes Windows EXTEND at boot instead of composing single. QEMU never
+            // re-notifies (static size), so the one-shot post-start scan self-triggers that arrival.
+            if (m_pVioGpuDod->IsDriverActive())
             {
-                DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s (%dx%d)\n", __FUNCTION__, xres, yres));
-                SetCustomDisplay((USHORT)xres, (USHORT)yres);
-                return TRUE;
+                UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates the hotplug arrival/departure
+                if (!wantConnected)
+                {
+                    // On disconnect, release the scanout on the host (DestroyFrameBufferObj with bReset=TRUE issues
+                    // SetScanout(i,0) and drops the resource). QEMU can then destroy the scanout's DisplayChannel
+                    // surface -> the server's capture skips it -> RTP goes silent (no frozen heartbeat for a head
+                    // that is gone). On reconnect, CreateFrameBufferObj sets a fresh scanout. Present to this head
+                    // is guarded (m_pFrameBuf[i] == NULL -> no-op).
+                    DestroyFrameBufferObj(TRUE, FALSE, i);
+                }
             }
+            // else: pre-active boot -> keep the HWInit seed (see above); the arrival comes post-start.
         }
     }
-    xres = NOM_WIDTH_SIZE;
-    yres = NOM_HEIGHT_SIZE;
-    SetCustomDisplay((USHORT)xres, (USHORT)yres);
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
-    return FALSE;
+    return any;
 }
 
 int VioGpuAdapter::ProcessEdid(void)
@@ -3273,14 +3556,53 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     PGPU_VBUFFER vbuf = NULL;
+    ULONG numScanouts = GetNumScanouts();
+    static const BYTE edid_magic[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
 
-    for (UINT32 i = 0; i < m_u32NumScanouts; i++)
+    for (UINT32 i = 0; i < numScanouts; i++)
     {
-        if (m_CtrlQueue.AskEdidInfo(&vbuf, i) && m_CtrlQueue.GetEdidInfo(vbuf, i, m_EDIDs))
+        // Store each scanout's EDID in its OWN slot: a single shared buffer would let
+        // a blank secondary EDID clobber the primary's, leaving both monitors
+        // identical / without modes.
+        if (m_CtrlQueue.AskEdidInfo(&vbuf, i) && m_CtrlQueue.GetEdidInfo(vbuf, i, m_EDIDs[i]))
         {
-            m_bEDID = TRUE;
+            // Only accept it if the EDID header magic is present; QEMU hands a
+            // real EDID to some scanouts and a blank block to the others.
+            if (RtlCompareMemory(m_EDIDs[i], edid_magic, sizeof(edid_magic)) == sizeof(edid_magic))
+            {
+                m_bEDID[i] = TRUE;
+            }
+            else
+            {
+            }
+        }
+        else
+        {
         }
         m_CtrlQueue.ReleaseBuffer(vbuf);
+    }
+
+    // Any head that has no real EDID gets a COPY of the primary's (so it exposes
+    // real native modes) but with a DISTINCT MONITOR IDENTITY, so Windows treats the
+    // heads as different monitors and can compose a multi-source VidPN.
+    // Nudge BOTH the product code (bytes 10-11) AND the serial (byte 12): with only the
+    // serial byte differing, the two heads were near-twins and Windows restored the
+    // extended arrangement NON-DETERMINISTICALLY (random "show only on X" on re-extend,
+    // because it conflated the two near-identical monitors when persisting/restoring the
+    // CCD config). A distinct product code makes head i a different model → stable identity.
+    if (m_bEDID[0])
+    {
+        for (UINT32 i = 1; i < numScanouts; i++)
+        {
+            if (!m_bEDID[i])
+            {
+                RtlCopyMemory(m_EDIDs[i], m_EDIDs[0], EDID_RAW_BLOCK_SIZE);
+                m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i);       // product code low byte (distinct model)
+                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
+                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
+                m_bEDID[i] = TRUE;
+            }
+        }
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -3529,17 +3851,25 @@ void VioGpuAdapter::SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo)
     pMode->ScreenStride = (pModeInfo->XResolution * 4 + 3) & ~0x3;
 }
 
-NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
+NTSTATUS VioGpuAdapter::UpdateChildStatus(UINT childUid, BOOLEAN connect)
 {
     PAGED_CODE();
     NTSTATUS Status(STATUS_SUCCESS);
     DXGK_CHILD_STATUS ChildStatus;
     PDXGKRNL_INTERFACE pDXGKInterface(m_pVioGpuDod->GetDxgkInterface());
 
-    RtlZeroMemory(&ChildStatus, sizeof(ChildStatus));
+    if (childUid >= MAX_SCANOUTS)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
 
+    // Remember the state QueryChildStatus will report for this child, then tell
+    // dxgkrnl the monitor on this target connected/disconnected.
+    m_bConnected[childUid] = connect;
+
+    RtlZeroMemory(&ChildStatus, sizeof(ChildStatus));
     ChildStatus.Type = StatusConnection;
-    ChildStatus.ChildUid = 0;
+    ChildStatus.ChildUid = childUid;
     ChildStatus.HotPlug.Connected = connect;
     Status = pDXGKInterface->DxgkCbIndicateChildStatus(pDXGKInterface->DeviceHandle, &ChildStatus);
     if (Status != STATUS_SUCCESS)
@@ -3550,9 +3880,14 @@ NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
     return Status;
 }
 
-void VioGpuAdapter::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
+void VioGpuAdapter::SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ USHORT yres)
 {
     PAGED_CODE();
+
+    if (scanId >= MAX_SCANOUTS)
+    {
+        scanId = 0;
+    }
 
     VIOGPU_DISP_MODE tmpModeInfo = {0};
 
@@ -3564,10 +3899,8 @@ void VioGpuAdapter::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     tmpModeInfo.XResolution = m_pVioGpuDod->IsFlexResolution() ? xres : max(MIN_WIDTH_SIZE, xres);
     tmpModeInfo.YResolution = m_pVioGpuDod->IsFlexResolution() ? yres : max(MIN_HEIGHT_SIZE, yres);
 
-    DbgPrint(TRACE_LEVEL_FATAL,
-             ("%s - %d (%dx%d)\n", __FUNCTION__, m_CustomModeIndex, tmpModeInfo.XResolution, tmpModeInfo.YResolution));
 
-    SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
+    SetVideoModeInfo(m_CustomModeIndex[scanId], &tmpModeInfo);
 }
 
 NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
@@ -3582,7 +3915,10 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
     m_ModeInfo = NULL;
     m_ModeCount = 0;
 
-    m_ModeCount = ProcessEdid() + 1;
+    // Reserve one custom mode slot PER scanout at the end of the list, so each
+    // head can carry its own resize target without overwriting the others.
+    ULONG numScanouts = GetNumScanouts();
+    m_ModeCount = ProcessEdid() + numScanouts;
 
     m_ModeInfo = new (PagedPool) VIDEO_MODE_INFORMATION[m_ModeCount];
     if (!m_ModeInfo)
@@ -3593,14 +3929,14 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
     }
     RtlZeroMemory(m_ModeInfo, sizeof(VIDEO_MODE_INFORMATION) * m_ModeCount);
 
-    SetCurrentModeIndex(0);
+    SetCurrentModeIndex(0, 0);
 
     pDispInfo->Height = max(pDispInfo->Height, MIN_HEIGHT_SIZE);
     pDispInfo->Width = max(pDispInfo->Width, MIN_WIDTH_SIZE);
     pDispInfo->ColorFormat = D3DDDIFMT_X8R8G8B8;
     pDispInfo->Pitch = (BPPFromPixelFormat(pDispInfo->ColorFormat) / BITS_PER_BYTE) * pDispInfo->Width;
 
-    for (USHORT indx = 0; indx < m_ModeCount - 1; indx++)
+    for (USHORT indx = 0; indx < m_ModeCount - numScanouts; indx++)
     {
 
         PVIOGPU_DISP_MODE pModeInfo = &gpu_disp_modes[indx];
@@ -3615,17 +3951,24 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
         SetVideoModeInfo(indx, pModeInfo);
         if (pModeInfo->XResolution == NOM_WIDTH_SIZE && pModeInfo->YResolution == NOM_HEIGHT_SIZE)
         {
-            SetCurrentModeIndex(indx);
-            DbgPrint(TRACE_LEVEL_FATAL,
+            SetCurrentModeIndex(0, indx);
+            DbgPrint(TRACE_LEVEL_VERBOSE,
                      ("%s: modes[%d] x_res = %d, y_res = %d\n",
                       __FUNCTION__,
-                      m_CurrentModeIndex,
+                      GetCurrentModeIndex(0),
                       pModeInfo->XResolution,
                       pModeInfo->YResolution));
         }
     }
 
-    m_CustomModeIndex = (USHORT)(m_ModeCount - 1);
+    // Custom slots are the last numScanouts entries: m_CustomModeIndex[i] = base + i.
+    // Seed each with a valid default so a head that never reports a host size is
+    // still a usable mode (GetDisplayInfo refines it when a real size arrives).
+    for (UINT i = 0; i < numScanouts; i++)
+    {
+        m_CustomModeIndex[i] = (USHORT)(m_ModeCount - numScanouts + i);
+        SetCustomDisplay(i, NOM_WIDTH_SIZE, NOM_HEIGHT_SIZE);
+    }
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("ModeCount filtered %d\n", m_ModeCount));
 
@@ -3633,8 +3976,8 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
 
     if (m_pVioGpuDod->IsPersistentDispMode0Set())
     {
-        SetCustomDisplay(m_pVioGpuDod->GetPersistentDispMode0Width(), m_pVioGpuDod->GetPersistentDispMode0Height());
-        SetCurrentModeIndex(m_CurrentModeIndex);
+        SetCustomDisplay(0, m_pVioGpuDod->GetPersistentDispMode0Width(), m_pVioGpuDod->GetPersistentDispMode0Height());
+        SetCurrentModeIndex(0, GetCurrentModeIndex(0));
     }
 
     for (UINT idx = 0; idx < m_ModeCount; idx++)
@@ -3653,24 +3996,35 @@ PAGED_CODE_SEG_END
 
 BOOLEAN VioGpuAdapter::ResetToVgaMode(void)
 {
-    DestroyFrameBufferObj(TRUE, TRUE);
+    // Detach every head before the device is reset, as the D3 path does. bKeepBuffer stays TRUE: this runs on the
+    // bugcheck path, possibly above DISPATCH_LEVEL, where DestroyFrameBufferObj must not take the guarded mutex.
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        DestroyFrameBufferObj(TRUE, TRUE, scan);
+    }
     VioGpuAdapterClose();
     return TRUE;
 }
 
-void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer)
+void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s scan %d\n", __FUNCTION__, scanId));
     UINT resid = 0;
 
-    if (m_pFrameBuf != NULL)
+    // Serialise against the present/blackout readers so they never deref a deleted object or transfer to a
+    // recycled id. bKeepBuffer marks the bugcheck flow (ResetToVgaMode): it can run at high IRQL and keeps the
+    // object anyway, so it must NOT take the guarded mutex.
+    const BOOLEAN useLock = !bKeepBuffer;
+    if (useLock)
+        KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);
+    if (m_pFrameBuf[scanId] != NULL)
     {
-        resid = (UINT)m_pFrameBuf->GetId();
+        resid = (UINT)m_pFrameBuf[scanId]->GetId();
         m_CtrlQueue.DetachBacking(resid);
         m_CtrlQueue.DestroyResource(resid);
         if (bReset == TRUE)
         {
-            m_CtrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+            m_CtrlQueue.SetScanout(scanId, 0, 0, 0, 0, 0);
         }
 
         if (bKeepBuffer)
@@ -3680,11 +4034,13 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer)
         }
         else
         {
-            delete m_pFrameBuf;
+            delete m_pFrameBuf[scanId];
         }
-        m_pFrameBuf = NULL;
+        m_pFrameBuf[scanId] = NULL;
         m_Idr.PutId(resid);
     }
+    if (useLock)
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
@@ -3780,6 +4136,21 @@ void VioGpuAdapter::ThreadWork(_In_ PVOID Context)
     pdev->ThreadWorkRoutine();
 }
 
+void VioGpuAdapter::TriggerInitialScan(void)
+{
+    // One-shot, DETERMINISTIC: called by VioGpuDod::CommitVidPn the first time Windows commits a boot topology.
+    // No timer (timers are non-deterministic and can fire in unexpected states) -- this is tied to a real dxgk
+    // event. It only SIGNALS the worker; the actual GetDisplayInfo / DxgkCbIndicateChildStatus runs there
+    // (PASSIVE_LEVEL), never re-entrantly from inside the CommitVidPn DDI. m_bInitialScanArmed makes it fire once.
+    // CommitVidPn calls are serialized by dxgkrnl, so the plain BOOLEAN guard needs no interlock.
+    if (!m_bInitialScanArmed)
+    {
+        m_bInitialScanArmed = TRUE;
+        InterlockedExchange(&m_InitialScanPending, 1);
+        KeSetEvent(&m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 void VioGpuAdapter::ThreadWorkRoutine(void)
 {
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
@@ -3793,6 +4164,14 @@ void VioGpuAdapter::ThreadWorkRoutine(void)
             PsTerminateSystemThread(STATUS_SUCCESS);
             break;
         }
+        if (InterlockedExchange(&m_InitialScanPending, 0))
+        {
+            // One-shot post-start scan (see TriggerInitialScan): now that the driver is active, re-read the host display
+            // state so any secondary the host enabled at boot -- kept disconnected at the HWInit seed until now --
+            // is indicated as a hotplug ARRIVAL -> Windows extends. (Matches the DRM model: index>0 starts disabled
+            // and comes up via the display event.)
+            GetDisplayInfo();
+        }
         ConfigChanged();
         NotifyResolutionEvent();
     }
@@ -3805,12 +4184,15 @@ void VioGpuAdapter::ConfigChanged(void)
     virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_read), &events_read, sizeof(m_u32NumScanouts));
     if (events_read & VIRTIO_GPU_EVENT_DISPLAY)
     {
-        GetDisplayInfo();
+        // Acknowledge BEFORE reading the heads. The host raises one event per console it reconfigures, so a mono to
+        // dual switch can bring a second event while the first is being read. Clearing after the read wiped that
+        // second event too: the next pass found no event, skipped the read, and the intermediate layout stayed.
+        // Cleared first, a later event sets the bit again and the next pass reads the final layout.
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(m_u32NumScanouts));
-        //        UpdateChildStatus(FALSE);
-        //        ProcessEdid();
-        UpdateChildStatus(TRUE);
+        // GetDisplayInfo() drives per-scanout hotplug (connect/disconnect from pmodes[i].enabled) via
+        // UpdateChildStatus: nothing else to do here.
+        GetDisplayInfo();
     }
 }
 
@@ -3833,7 +4215,7 @@ VOID VioGpuAdapter::DpcRoutine(_In_ PDXGKRNL_INTERFACE pDxgkInterface)
 
                 if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC)
                 {
-                    DbgPrint(TRACE_LEVEL_FATAL, ("!!!!! Command failed %d", resp->type));
+                    DbgPrint(TRACE_LEVEL_FATAL, ("!!!!! Command failed resp=%d (0x%x) cmd=0x%x", resp->type, resp->type, pcmd->type));
                 }
                 if (resp->type != VIRTIO_GPU_RESP_OK_NODATA)
                 {
@@ -3901,14 +4283,17 @@ UINT ColorFormat(UINT format)
 }
 
 PAGED_CODE_SEG_BEGIN
-BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode)
+BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode, UINT scanId)
 {
     UINT resid, format, size;
     VioGpuObj *obj;
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_INFORMATION,
-             ("---> %s - %d: (%d x %d)\n", __FUNCTION__, m_Id, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight));
-    ASSERT(m_pFrameBuf == NULL);
+             ("---> %s - %d: scan %d (%d x %d)\n", __FUNCTION__, m_Id, scanId, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight));
+    // Hold the scanout lock while we build and publish m_pFrameBuf[scanId], so it is serialised against a
+    // concurrent hotplug-disconnect DestroyFrameBufferObj and against the present/blackout readers.
+    KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);
+    ASSERT(m_pFrameBuf[scanId] == NULL);
     size = pModeInfo->ScreenStride * pModeInfo->VisScreenHeight;
     format = ColorFormat(pCurrentMode->DispInfo.ColorFormat);
     DbgPrint(TRACE_LEVEL_INFORMATION,
@@ -3916,22 +4301,24 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     resid = m_Idr.GetId();
     m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
     obj = new (NonPagedPoolNx) VioGpuObj();
-    if (!obj->Init(size, &m_FrameSegment))
+    if (!obj->Init(size, &m_FrameSegment[scanId]))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to init obj size = %d\n", __FUNCTION__, size));
         m_CtrlQueue.DestroyResource(resid);
         m_Idr.PutId(resid);
         delete obj;
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
         return FALSE;
     }
 
     GpuObjectAttach(resid, obj);
-    m_CtrlQueue.SetScanout(0 /*FIXME m_Id*/, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
+    m_CtrlQueue.SetScanout(scanId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.ResFlush(resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
-    m_pFrameBuf = obj;
+    m_pFrameBuf[scanId] = obj;
     pCurrentMode->FrameBuffer = obj->GetVirtualAddress();
     pCurrentMode->Flags.FrameBufferIsActive = TRUE;
+    KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
 }

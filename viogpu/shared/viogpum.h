@@ -46,13 +46,31 @@ typedef struct _VIOGPU_ESCAPE
 {
     USHORT Type;
     USHORT DataLength;
+    // Head for GET/SET_CUSTOM_RESOLUTION (the caller's VidPnSourceId), 0 for GET_DEVICE_ID. The driver tells
+    // the 8-byte single-head layout below (no ScanId, the union at offset 4) apart by its size.
+    USHORT ScanId;
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+
+// The single-head escape, as tools built on the upstream header send it.
+typedef struct _VIOGPU_ESCAPE_SINGLE_HEAD
+{
+    USHORT Type;
+    USHORT DataLength;
+    union {
+        ULONG Id;
+        VIOGPU_DISP_MODE Resolution;
+    } DUMMYUNIONNAME;
+} VIOGPU_ESCAPE_SINGLE_HEAD, *PVIOGPU_ESCAPE_SINGLE_HEAD;
 #pragma pack()
 
 #define BASE_NAMED_OBJECTS    L"\\BaseNamedObjects\\"
 #define GLOBAL_OBJECTS        L"Global\\"
 #define RESOLUTION_EVENT_NAME L"VioGpuResolutionEvent"
+// One auto-reset event per source, named RESOLUTION_HEAD_EVENT_NAME<device id>_<VidPnSourceId>. It stays signaled
+// until that source's agent thread waits on it, so a change that comes while the thread is busy is not lost, unlike
+// the RESOLUTION_EVENT_NAME pulse that older agents use.
+#define RESOLUTION_HEAD_EVENT_NAME L"VioGpuResolutionHeadEvent"

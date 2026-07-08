@@ -91,7 +91,9 @@ class GpuAdapter
     HANDLE m_hResolutionEvent;
     HDC m_hDC;
     D3DKMT_HANDLE m_hAdapter;
-    ULONG m_Index;
+    ULONG m_Index;      // this display's path index (matched by GDI device name) - for path ops
+    ULONG m_DeviceId;   // device id (GET_DEVICE_ID) - shared per-device, used for the event name
+    UINT m_SourceId;    // this display's VidPnSourceId - identifies the head for escape targeting
     UINT m_PathArrayElements;
     UINT m_ModeInfoArrayElements;
     DISPLAYCONFIG_PATH_INFO *m_pDisplayPathInfo;

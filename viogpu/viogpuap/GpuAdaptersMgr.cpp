@@ -260,7 +260,9 @@ void GpuAdaptersMgr::AddAdapter(const wchar_t *name)
 
     for (Iterator it = Adapters.begin(); it != Adapters.end(); it++)
     {
-        if (_wcsnicmp((*it)->m_DeviceName.c_str(), name, (*it)->m_DeviceName.size()) == 0)
+        // EXACT match, not prefix: _wcsnicmp over m_DeviceName.size() made "\\.\DISPLAY1" match "\\.\DISPLAY10",
+        // "\\.\DISPLAY11", … → the 10th+ head would be conflated with the 1st and never get its own adapter.
+        if (_wcsicmp((*it)->m_DeviceName.c_str(), name) == 0)
         {
             (*it)->SetStatus(Active);
             return;
