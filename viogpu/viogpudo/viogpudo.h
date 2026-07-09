@@ -86,6 +86,7 @@ class VioGpuAdapter : IVioGpuPCI
                            DEVICE_POWER_STATE DevicePowerState,
                            CURRENT_MODE *pCurrentMode);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
+    void ArmInitialScan(void);   // called by VioGpuDod::StartDevice once the driver is active
     NTSTATUS HWClose(void);
     NTSTATUS ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
                                        _In_ UINT DstBitPerPixel,
@@ -189,6 +190,8 @@ class VioGpuAdapter : IVioGpuPCI
     void static ThreadWork(_In_ PVOID Context);
     void ThreadWorkRoutine(void);
     void ConfigChanged(void);
+    void static InitialScanDpc(_In_ struct _KDPC *Dpc, _In_opt_ PVOID Context, _In_opt_ PVOID Arg1,
+                               _In_opt_ PVOID Arg2);
     NTSTATUS VirtIoDeviceInit(void);
     VOID CreateResolutionEvent(VOID);
     VOID NotifyResolutionEvent(VOID);
@@ -223,6 +226,14 @@ class VioGpuAdapter : IVioGpuPCI
     KEVENT m_ConfigUpdateEvent;
     PETHREAD m_pWorkThread;
     BOOLEAN m_bStopWorkThread;
+    // Post-start deferred re-scan. The host may enable a secondary head "très tôt" (before StartDevice makes the
+    // driver active); GetDisplayInfo's boot-latch keeps it disconnected because no DxgkCbIndicateChildStatus arrival
+    // is legal mid-Start. Armed at the end of StartDevice, this one-shot timer fires once the driver is fully active
+    // and signals the worker to re-run GetDisplayInfo, turning the still-enabled secondary into a proper hotplug
+    // arrival -> Windows extends. QEMU never re-notifies (its size is static), so the driver self-triggers this.
+    KTIMER m_InitialScanTimer;
+    KDPC m_InitialScanDpc;
+    volatile LONG m_InitialScanPending;
     PKEVENT m_ResolutionEvent;
     HANDLE m_ResolutionEventHandle;
 };

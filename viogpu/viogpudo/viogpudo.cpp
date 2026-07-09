@@ -244,6 +244,12 @@ NTSTATUS VioGpuDod::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
     *pNumberOfViews = numScanouts;
     *pNumberOfChildren = numScanouts;
     m_Flags.DriverStarted = TRUE;
+    // Driver is now active: arm a one-shot re-scan so any secondary the host enabled before this point (kept
+    // disconnected by GetDisplayInfo's boot-latch) is re-evaluated and indicated as a hotplug arrival -> extend.
+    if (m_pHWDevice)
+    {
+        m_pHWDevice->ArmInitialScan();
+    }
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return STATUS_SUCCESS;
 }
@@ -384,11 +390,17 @@ NTSTATUS VioGpuDod::QueryChildRelations(_Out_writes_bytes_(ChildRelationsSize) D
 
     for (UINT ChildIndex = 0; ChildIndex < ChildRelationsCount; ++ChildIndex)
     {
+        // Only the PRIMARY (scanout 0) is the VGA post-display output → always-connected / internal panel. The
+        // SECONDARY heads are HOTPLUGGABLE: report them Interruptible + external (HD15) so Windows HONORS their
+        // QueryChildStatus (connect/disconnect from m_bConnected). Reporting AlwaysConnected/INTERNAL for a
+        // secondary made Windows treat it as a soldered panel and IGNORE QueryChildStatus entirely — so it stayed
+        // connected regardless of GET_DISPLAY_INFO enabled=0 and a refused EDID → phantom 2nd monitor at boot.
+        BOOLEAN primaryVga = (ChildIndex == 0) && IsVgaDevice();
         pChildRelations[ChildIndex].ChildDeviceType = TypeVideoOutput;
-        pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = IsVgaDevice() ? HpdAwarenessAlwaysConnected
-                                                                                   : HpdAwarenessInterruptible;
-        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = IsVgaDevice() ? D3DKMDT_VOT_INTERNAL
-                                                                                                           : D3DKMDT_VOT_HD15;
+        pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = primaryVga ? HpdAwarenessAlwaysConnected
+                                                                                : HpdAwarenessInterruptible;
+        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = primaryVga ? D3DKMDT_VOT_INTERNAL
+                                                                                                        : D3DKMDT_VOT_HD15;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
         pChildRelations[ChildIndex].AcpiUid = 0;
@@ -829,7 +841,7 @@ VioGpuDod::RecommendFunctionalVidPn(_In_ CONST DXGKARG_RECOMMENDFUNCTIONALVIDPN 
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+    DbgPrint(TRACE_LEVEL_FATAL, ("RecommendFunctionalVidPn CALLED (returning NO_RECOMMENDED)\n"));
 
     VIOGPU_ASSERT(pRecommendFunctionalVidPn == NULL);
 
@@ -840,7 +852,7 @@ NTSTATUS VioGpuDod::RecommendVidPnTopology(_In_ CONST DXGKARG_RECOMMENDVIDPNTOPO
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+    DbgPrint(TRACE_LEVEL_FATAL, ("RecommendVidPnTopology CALLED (returning NO_RECOMMENDED)\n"));
 
     VIOGPU_ASSERT(pRecommendVidPnTopology == NULL);
 
@@ -851,7 +863,7 @@ NTSTATUS VioGpuDod::RecommendMonitorModes(_In_ CONST DXGKARG_RECOMMENDMONITORMOD
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    DbgPrint(TRACE_LEVEL_FATAL, ("RecommendMonitorModes CALLED\n"));
 
     return AddSingleMonitorMode(pRecommendMonitorModes);
 }
@@ -1640,6 +1652,11 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
         goto CommitVidPnExit;
     }
 
+    // Diag (random "show only on X"): how many paths did Windows COMMIT? 2 = extend, 1 = single/second-screen-only.
+    DbgPrint(TRACE_LEVEL_FATAL, ("CommitVidPn AffectedSrc=%u NumPaths=%llu (%s)\n",
+                                 pCommitVidPn->AffectedVidPnSourceId, (ULONGLONG)NumPaths,
+                                 NumPaths >= 2 ? "EXTEND" : "single/off"));
+
     if (NumPaths != 0)
     {
         Status = pVidPnInterface->pfnAcquireSourceModeSet(pCommitVidPn->hFunctionalVidPn,
@@ -2389,6 +2406,9 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_u32NumScanouts = 0;
 
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
+    m_InitialScanPending = 0;
+    KeInitializeDpc(&m_InitialScanDpc, InitialScanDpc, this);
+    KeInitializeTimer(&m_InitialScanTimer);
 }
 
 VioGpuAdapter::~VioGpuAdapter(void)
@@ -2837,6 +2857,11 @@ NTSTATUS VioGpuAdapter::HWClose(void)
 
     LARGE_INTEGER timeout = {0};
     timeout.QuadPart = Int32x32To64(1000, -10000);
+
+    // Cancel any pending post-start re-scan and flush a DPC that may already be queued, so InitialScanDpc cannot
+    // touch this adapter while/after it is torn down.
+    KeCancelTimer(&m_InitialScanTimer);
+    KeFlushQueuedDpcs();
 
     m_bStopWorkThread = TRUE;
     KeSetEvent(&m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
@@ -3317,6 +3342,13 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
         if (ok && xres && yres)
         {
             SetCustomDisplay(i, (USHORT)xres, (USHORT)yres);
+            // Point this head's CURRENT mode index at its CUSTOM slot (the host-preferred size) as soon as we
+            // learn the size — do NOT wait for a VidPN commit. Otherwise m_CurrentModeIndex[i] stays 0 for an
+            // uncommitted secondary, so RecommendMonitorModes/AddSingleMonitorMode advertises mode[0] (a small
+            // default) as this monitor's PREFERRED mode → Windows composes the extended layout wrong and falls
+            // back to "second screen only". That never commits head i → the index stays 0 → self-reinforcing
+            // random single/extend on re-extend. Seeding the correct preferred here breaks the cycle.
+            SetCurrentModeIndex(i, m_CustomModeIndex[i]);
             any = TRUE;
         }
 
@@ -3348,7 +3380,15 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             }
             else
             {
-                m_bConnected[i] = wantConnected;        // Start time: latch only, no indicate
+                // Boot-latch (driver not yet active): the PRIMARY latches its real state, but a SECONDARY stays
+                // DISCONNECTED even if the host already reports it enabled (server attached it "très tôt", before
+                // StartDevice). Latching a secondary connected here makes the initial QueryChildStatus report it
+                // connected WITHOUT a DxgkCbIndicateChildStatus arrival -> Windows composes a SINGLE boot topology
+                // and never extends. Kept FALSE it boots mono; the post-start deferred re-scan (ArmInitialScan)
+                // re-runs GetDisplayInfo with IsDriverActive()==TRUE -> wantConnected(TRUE) != m_bConnected(FALSE)
+                // -> UpdateChildStatus connect=1 -> hotplug ARRIVAL -> extend (the runtime path that already works).
+                // QEMU never re-notifies (its size is static), so the driver must self-trigger that re-scan.
+                m_bConnected[i] = (i == 0) ? wantConnected : FALSE;
             }
         }
     }
@@ -3429,9 +3469,13 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
     }
 
     // Any head that has no real EDID gets a COPY of the primary's (so it exposes
-    // real native modes) but with a distinct serial + fixed-up block-0 checksum,
-    // so Windows treats the heads as DISTINCT monitors and can compose a
-    // multi-source VidPN instead of rolling the commit back forever.
+    // real native modes) but with a DISTINCT MONITOR IDENTITY, so Windows treats the
+    // heads as different monitors and can compose a multi-source VidPN.
+    // Nudge BOTH the product code (bytes 10-11) AND the serial (byte 12): with only the
+    // serial byte differing, the two heads were near-twins and Windows restored the
+    // extended arrangement NON-DETERMINISTICALLY (random "show only on X" on re-extend,
+    // because it conflated the two near-identical monitors when persisting/restoring the
+    // CCD config). A distinct product code makes head i a different model → stable identity.
     if (m_bEDID[0])
     {
         for (UINT32 i = 1; i < numScanouts; i++)
@@ -3439,8 +3483,9 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
             if (!m_bEDID[i])
             {
                 RtlCopyMemory(m_EDIDs[i], m_EDIDs[0], EDID_RAW_BLOCK_SIZE);
-                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);   // nudge the serial byte
-                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - i); // keep block-0 checksum == 0
+                m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i);       // product code low byte (distinct model)
+                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
+                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
                 m_bEDID[i] = TRUE;
                 DbgPrint(TRACE_LEVEL_FATAL, ("EDID scanout %u synthesized from primary\n", i));
             }
@@ -3972,6 +4017,31 @@ void VioGpuAdapter::ThreadWork(_In_ PVOID Context)
     pdev->ThreadWorkRoutine();
 }
 
+void VioGpuAdapter::ArmInitialScan(void)
+{
+    // Fire ~1 s after StartDevice returns: late enough that dxgkrnl is ready for DxgkCbIndicateChildStatus (calling
+    // it during/at StartDevice is illegal), early enough to feel instant. The DPC only signals the worker; the
+    // actual re-scan (GetDisplayInfo is PAGED / PASSIVE_LEVEL) runs on the worker thread.
+    LARGE_INTEGER due;
+    due.QuadPart = Int32x32To64(1000, -10000);   // 1 s, relative (100 ns units)
+    KeSetTimer(&m_InitialScanTimer, due, &m_InitialScanDpc);
+}
+
+void VioGpuAdapter::InitialScanDpc(_In_ struct _KDPC *Dpc, _In_opt_ PVOID Context, _In_opt_ PVOID Arg1,
+                                   _In_opt_ PVOID Arg2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+
+    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(Context);
+    if (pAdapter)
+    {
+        InterlockedExchange(&pAdapter->m_InitialScanPending, 1);
+        KeSetEvent(&pAdapter->m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 void VioGpuAdapter::ThreadWorkRoutine(void)
 {
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
@@ -3984,6 +4054,13 @@ void VioGpuAdapter::ThreadWorkRoutine(void)
         {
             PsTerminateSystemThread(STATUS_SUCCESS);
             break;
+        }
+        if (InterlockedExchange(&m_InitialScanPending, 0))
+        {
+            // Post-start deferred re-scan (see ArmInitialScan): re-evaluate host display state now that the driver
+            // is active, so a secondary the host enabled before StartDevice becomes a hotplug arrival instead of
+            // staying silently disconnected.
+            GetDisplayInfo();
         }
         ConfigChanged();
         NotifyResolutionEvent();
@@ -4024,7 +4101,7 @@ VOID VioGpuAdapter::DpcRoutine(_In_ PDXGKRNL_INTERFACE pDxgkInterface)
 
                 if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC)
                 {
-                    DbgPrint(TRACE_LEVEL_FATAL, ("!!!!! Command failed %d", resp->type));
+                    DbgPrint(TRACE_LEVEL_FATAL, ("!!!!! Command failed resp=%d (0x%x) cmd=0x%x", resp->type, resp->type, pcmd->type));
                 }
                 if (resp->type != VIRTIO_GPU_RESP_OK_NODATA)
                 {
