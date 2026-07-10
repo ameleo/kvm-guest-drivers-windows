@@ -3125,6 +3125,7 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
 
         crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
         crsr->resource_id = m_pCursorBuf->GetId();
+        crsr->pos.scanout_id = (ULONG)pModeCur->DispInfo.TargetId;
         crsr->pos.x = 0;
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
@@ -3168,15 +3169,9 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                           pSetPointerPosition->Y >= 0 && (UINT)pSetPointerPosition->X <= pModeCur->SrcModeWidth &&
                           (UINT)pSetPointerPosition->Y <= pModeCur->SrcModeHeight;
 
-        DbgPrint(TRACE_LEVEL_VERBOSE,
-                 ("---> %s (%d - %d) Visible = %d Value = %x VidPnSourceId = %d hidden = %d\n",
-                  __FUNCTION__,
-                  pSetPointerPosition->X,
-                  pSetPointerPosition->Y,
-                  pSetPointerPosition->Flags.Visible,
-                  pSetPointerPosition->Flags.Value,
-                  pSetPointerPosition->VidPnSourceId,
-                  m_bCursorHidden));
+        crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;
+        crsr->resource_id = m_pCursorBuf->GetId();
+        crsr->pos.scanout_id = (ULONG)pModeCur->DispInfo.TargetId;
 
         if (!visible && m_bCursorHidden)
         {
