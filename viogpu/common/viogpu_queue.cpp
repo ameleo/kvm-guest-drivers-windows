@@ -394,27 +394,18 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
         // cursor image (issue #977). Completing the transfer on the control
         // queue guarantees the resource is up to date when UPDATE_CURSOR runs.
         KEVENT event;
-        NTSTATUS status;
         KeInitializeEvent(&event, NotificationEvent, FALSE);
         vbuf->complete_cb = NotifyEventCompleteCB;
         vbuf->complete_ctx = &event;
         vbuf->auto_release = false;
 
-        LARGE_INTEGER timeout = {0};
-        timeout.QuadPart = Int32x32To64(100, -10000); // 100 ms safety net
-
         QueueBuffer(vbuf);
-        status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
-        if (status == STATUS_TIMEOUT)
-        {
-            // Device did not complete in time; the buffer may still be in
-            // flight, so leak it rather than free a buffer the device owns.
-            DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s transfer wait timed out\n", __FUNCTION__));
-        }
-        else
-        {
-            ReleaseBuffer(vbuf);
-        }
+        // Wait INFINITE, never with a timeout: complete_ctx points at the on-stack event above,
+        // so returning (and unwinding the stack) while the buffer is still in flight would let a
+        // later completion KeSetEvent a dead stack address -> memory corruption. The device applies
+        // this transfer promptly; the upstream Ask* helpers wait the same way.
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        ReleaseBuffer(vbuf);
     }
     else
     {
