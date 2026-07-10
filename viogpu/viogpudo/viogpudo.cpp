@@ -244,12 +244,9 @@ NTSTATUS VioGpuDod::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
     *pNumberOfViews = numScanouts;
     *pNumberOfChildren = numScanouts;
     m_Flags.DriverStarted = TRUE;
-    // Driver is now active: arm a one-shot re-scan so any secondary the host enabled before this point (kept
-    // disconnected by GetDisplayInfo's boot-latch) is re-evaluated and indicated as a hotplug arrival -> extend.
-    if (m_pHWDevice)
-    {
-        m_pHWDevice->ArmInitialScan();
-    }
+    // The one-shot post-start scan is triggered from the FIRST CommitVidPn (see TriggerInitialScan), not here:
+    // DxgkCbIndicateChildStatus is illegal during StartDevice, and CommitVidPn is the point where Windows has
+    // actually composed its boot topology -- the right moment to indicate the secondary arrival so it extends.
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return STATUS_SUCCESS;
 }
@@ -841,7 +838,6 @@ VioGpuDod::RecommendFunctionalVidPn(_In_ CONST DXGKARG_RECOMMENDFUNCTIONALVIDPN 
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_FATAL, ("RecommendFunctionalVidPn CALLED (returning NO_RECOMMENDED)\n"));
 
     VIOGPU_ASSERT(pRecommendFunctionalVidPn == NULL);
 
@@ -852,7 +848,6 @@ NTSTATUS VioGpuDod::RecommendVidPnTopology(_In_ CONST DXGKARG_RECOMMENDVIDPNTOPO
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_FATAL, ("RecommendVidPnTopology CALLED (returning NO_RECOMMENDED)\n"));
 
     VIOGPU_ASSERT(pRecommendVidPnTopology == NULL);
 
@@ -863,7 +858,6 @@ NTSTATUS VioGpuDod::RecommendMonitorModes(_In_ CONST DXGKARG_RECOMMENDMONITORMOD
 {
     PAGED_CODE();
 
-    DbgPrint(TRACE_LEVEL_FATAL, ("RecommendMonitorModes CALLED\n"));
 
     return AddSingleMonitorMode(pRecommendMonitorModes);
 }
@@ -1652,10 +1646,17 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
         goto CommitVidPnExit;
     }
 
-    // Diag (random "show only on X"): how many paths did Windows COMMIT? 2 = extend, 1 = single/second-screen-only.
-    DbgPrint(TRACE_LEVEL_FATAL, ("CommitVidPn AffectedSrc=%u NumPaths=%llu (%s)\n",
-                                 pCommitVidPn->AffectedVidPnSourceId, (ULONGLONG)NumPaths,
-                                 NumPaths >= 2 ? "EXTEND" : "single/off"));
+
+    // Windows has composed a real topology (the boot commit is single). Trigger the ONE-SHOT post-start scan so a
+    // secondary the host enabled at boot -- kept at the HWInit seed (disconnected) until now -- is indicated as a
+    // hotplug ARRIVAL, which makes Windows re-compose and EXTEND. This replaces a magic timer: it is tied to the
+    // real "Windows finished its boot topology" event, like the Linux driver drives reconfiguration from the
+    // display event. The trigger only SIGNALS the worker; the actual GetDisplayInfo / DxgkCbIndicateChildStatus
+    // runs there (PASSIVE), never re-entrantly from inside this DDI. One-shot guard lives in TriggerInitialScan.
+    if (NumPaths != 0 && m_pHWDevice)
+    {
+        m_pHWDevice->TriggerInitialScan();
+    }
 
     if (NumPaths != 0)
     {
@@ -2407,8 +2408,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
 
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
     m_InitialScanPending = 0;
-    KeInitializeDpc(&m_InitialScanDpc, InitialScanDpc, this);
-    KeInitializeTimer(&m_InitialScanTimer);
+    m_bInitialScanArmed = FALSE;
 }
 
 VioGpuAdapter::~VioGpuAdapter(void)
@@ -2835,7 +2835,6 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
             VioGpuDbgBreak();
             return status;
         }
-        DbgPrint(TRACE_LEVEL_FATAL, ("FB segment scanout %u init OK size=%u\n", scan, req_size));
     }
 
     if (!m_CursorSegment.Init(POINTER_SIZE * POINTER_SIZE * 4, NULL))
@@ -2857,11 +2856,6 @@ NTSTATUS VioGpuAdapter::HWClose(void)
 
     LARGE_INTEGER timeout = {0};
     timeout.QuadPart = Int32x32To64(1000, -10000);
-
-    // Cancel any pending post-start re-scan and flush a DPC that may already be queued, so InitialScanDpc cannot
-    // touch this adapter while/after it is torn down.
-    KeCancelTimer(&m_InitialScanTimer);
-    KeFlushQueuedDpcs();
 
     m_bStopWorkThread = TRUE;
     KeSetEvent(&m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
@@ -3253,11 +3247,6 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     UINT getScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
                     pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenWidth;
                     pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenHeight;
-                    DbgPrint(TRACE_LEVEL_FATAL,
-                             ("GET_CUSTOM_RESOLUTION scan %u (%dx%d)\n",
-                              getScan,
-                              pVioGpuEscape->Resolution.XResolution,
-                              pVioGpuEscape->Resolution.YResolution));
                 }
                 break;
             }
@@ -3337,7 +3326,6 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             m_CtrlQueue.ReleaseBuffer(vbuf);
         }
 
-        DbgPrint(TRACE_LEVEL_FATAL, ("GetDisplayInfo scan %u ok=%d (%dx%d)\n", i, ok, xres, yres));
 
         if (ok && xres && yres)
         {
@@ -3362,34 +3350,28 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
         BOOLEAN wantConnected = (i == 0) ? TRUE : (ok && xres && yres);
         if (wantConnected != m_bConnected[i])
         {
+            // The connection state changes ONLY through DxgkCbIndicateChildStatus, which is legal only once the
+            // driver is active. So pre-active (during boot) we do NOTHING here: the state stays at its HWInit seed
+            // (m_bConnected[scan] = (scan == 0)) -- primary connected, secondaries disconnected -- exactly the
+            // DRM/virtio-gpu init model (index 0 enabled, index > 0 starts disabled). Sizes were already read into
+            // the custom slots above. A secondary the host reports enabled is therefore delivered as a proper
+            // hotplug ARRIVAL once active (TriggerInitialScan re-runs this with IsDriverActive() -> UpdateChildStatus
+            // connect), which is what makes Windows EXTEND at boot instead of composing single. QEMU never
+            // re-notifies (static size), so the one-shot post-start scan self-triggers that arrival.
             if (m_pVioGpuDod->IsDriverActive())
             {
-                UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates hotplug
+                UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates the hotplug arrival/departure
                 if (!wantConnected)
                 {
-                    // Phase 2b: on disconnect, release the scanout on the host
-                    // (DestroyFrameBufferObj with bReset=TRUE issues SetScanout(i,0)
-                    // and drops the resource). QEMU can then destroy the scanout's
-                    // DisplayChannel surface -> the server's capture skips it -> RTP
-                    // goes silent (no frozen heartbeat for a head that is gone). On
-                    // reconnect, CreateFrameBufferObj sets a fresh scanout. Present
-                    // to this head is guarded (m_pFrameBuf[i] == NULL -> no-op).
+                    // On disconnect, release the scanout on the host (DestroyFrameBufferObj with bReset=TRUE issues
+                    // SetScanout(i,0) and drops the resource). QEMU can then destroy the scanout's DisplayChannel
+                    // surface -> the server's capture skips it -> RTP goes silent (no frozen heartbeat for a head
+                    // that is gone). On reconnect, CreateFrameBufferObj sets a fresh scanout. Present to this head
+                    // is guarded (m_pFrameBuf[i] == NULL -> no-op).
                     DestroyFrameBufferObj(TRUE, FALSE, i);
-                    DbgPrint(TRACE_LEVEL_FATAL, ("scanout %u released (hotplug-out)\n", i));
                 }
             }
-            else
-            {
-                // Boot-latch (driver not yet active): the PRIMARY latches its real state, but a SECONDARY stays
-                // DISCONNECTED even if the host already reports it enabled (server attached it "très tôt", before
-                // StartDevice). Latching a secondary connected here makes the initial QueryChildStatus report it
-                // connected WITHOUT a DxgkCbIndicateChildStatus arrival -> Windows composes a SINGLE boot topology
-                // and never extends. Kept FALSE it boots mono; the post-start deferred re-scan (ArmInitialScan)
-                // re-runs GetDisplayInfo with IsDriverActive()==TRUE -> wantConnected(TRUE) != m_bConnected(FALSE)
-                // -> UpdateChildStatus connect=1 -> hotplug ARRIVAL -> extend (the runtime path that already works).
-                // QEMU never re-notifies (its size is static), so the driver must self-trigger that re-scan.
-                m_bConnected[i] = (i == 0) ? wantConnected : FALSE;
-            }
+            // else: pre-active boot -> keep the HWInit seed (see above); the arrival comes post-start.
         }
     }
 
@@ -3454,16 +3436,13 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
             if (RtlCompareMemory(m_EDIDs[i], edid_magic, sizeof(edid_magic)) == sizeof(edid_magic))
             {
                 m_bEDID[i] = TRUE;
-                DbgPrint(TRACE_LEVEL_FATAL, ("EDID scanout %u OK\n", i));
             }
             else
             {
-                DbgPrint(TRACE_LEVEL_FATAL, ("EDID scanout %u blank\n", i));
             }
         }
         else
         {
-            DbgPrint(TRACE_LEVEL_FATAL, ("EDID scanout %u query failed\n", i));
         }
         m_CtrlQueue.ReleaseBuffer(vbuf);
     }
@@ -3487,7 +3466,6 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
                 m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
                 m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
                 m_bEDID[i] = TRUE;
-                DbgPrint(TRACE_LEVEL_FATAL, ("EDID scanout %u synthesized from primary\n", i));
             }
         }
     }
@@ -3758,7 +3736,6 @@ NTSTATUS VioGpuAdapter::UpdateChildStatus(UINT childUid, BOOLEAN connect)
     ChildStatus.Type = StatusConnection;
     ChildStatus.ChildUid = childUid;
     ChildStatus.HotPlug.Connected = connect;
-    DbgPrint(TRACE_LEVEL_FATAL, ("UpdateChildStatus child %u connect=%d\n", childUid, connect));
     Status = pDXGKInterface->DxgkCbIndicateChildStatus(pDXGKInterface->DeviceHandle, &ChildStatus);
     if (Status != STATUS_SUCCESS)
     {
@@ -3787,12 +3764,6 @@ void VioGpuAdapter::SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ US
     tmpModeInfo.XResolution = m_pVioGpuDod->IsFlexResolution() ? xres : max(MIN_WIDTH_SIZE, xres);
     tmpModeInfo.YResolution = m_pVioGpuDod->IsFlexResolution() ? yres : max(MIN_HEIGHT_SIZE, yres);
 
-    DbgPrint(TRACE_LEVEL_FATAL,
-             ("SetCustomDisplay scan %u slot %d (%dx%d)\n",
-              scanId,
-              m_CustomModeIndex[scanId],
-              tmpModeInfo.XResolution,
-              tmpModeInfo.YResolution));
 
     SetVideoModeInfo(m_CustomModeIndex[scanId], &tmpModeInfo);
 }
@@ -3846,7 +3817,7 @@ NTSTATUS VioGpuAdapter::BuildModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
         if (pModeInfo->XResolution == NOM_WIDTH_SIZE && pModeInfo->YResolution == NOM_HEIGHT_SIZE)
         {
             SetCurrentModeIndex(0, indx);
-            DbgPrint(TRACE_LEVEL_FATAL,
+            DbgPrint(TRACE_LEVEL_VERBOSE,
                      ("%s: modes[%d] x_res = %d, y_res = %d\n",
                       __FUNCTION__,
                       GetCurrentModeIndex(0),
@@ -4017,28 +3988,18 @@ void VioGpuAdapter::ThreadWork(_In_ PVOID Context)
     pdev->ThreadWorkRoutine();
 }
 
-void VioGpuAdapter::ArmInitialScan(void)
+void VioGpuAdapter::TriggerInitialScan(void)
 {
-    // Fire ~1 s after StartDevice returns: late enough that dxgkrnl is ready for DxgkCbIndicateChildStatus (calling
-    // it during/at StartDevice is illegal), early enough to feel instant. The DPC only signals the worker; the
-    // actual re-scan (GetDisplayInfo is PAGED / PASSIVE_LEVEL) runs on the worker thread.
-    LARGE_INTEGER due;
-    due.QuadPart = Int32x32To64(1000, -10000);   // 1 s, relative (100 ns units)
-    KeSetTimer(&m_InitialScanTimer, due, &m_InitialScanDpc);
-}
-
-void VioGpuAdapter::InitialScanDpc(_In_ struct _KDPC *Dpc, _In_opt_ PVOID Context, _In_opt_ PVOID Arg1,
-                                   _In_opt_ PVOID Arg2)
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(Arg1);
-    UNREFERENCED_PARAMETER(Arg2);
-
-    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(Context);
-    if (pAdapter)
+    // One-shot, DETERMINISTIC: called by VioGpuDod::CommitVidPn the first time Windows commits a boot topology.
+    // No timer (timers are non-deterministic and can fire in unexpected states) -- this is tied to a real dxgk
+    // event. It only SIGNALS the worker; the actual GetDisplayInfo / DxgkCbIndicateChildStatus runs there
+    // (PASSIVE_LEVEL), never re-entrantly from inside the CommitVidPn DDI. m_bInitialScanArmed makes it fire once.
+    // CommitVidPn calls are serialized by dxgkrnl, so the plain BOOLEAN guard needs no interlock.
+    if (!m_bInitialScanArmed)
     {
-        InterlockedExchange(&pAdapter->m_InitialScanPending, 1);
-        KeSetEvent(&pAdapter->m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
+        m_bInitialScanArmed = TRUE;
+        InterlockedExchange(&m_InitialScanPending, 1);
+        KeSetEvent(&m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
     }
 }
 
@@ -4057,9 +4018,10 @@ void VioGpuAdapter::ThreadWorkRoutine(void)
         }
         if (InterlockedExchange(&m_InitialScanPending, 0))
         {
-            // Post-start deferred re-scan (see ArmInitialScan): re-evaluate host display state now that the driver
-            // is active, so a secondary the host enabled before StartDevice becomes a hotplug arrival instead of
-            // staying silently disconnected.
+            // One-shot post-start scan (see TriggerInitialScan): now that the driver is active, re-read the host display
+            // state so any secondary the host enabled at boot -- kept disconnected at the HWInit seed until now --
+            // is indicated as a hotplug ARRIVAL -> Windows extends. (Matches the DRM model: index>0 starts disabled
+            // and comes up via the display event.)
             GetDisplayInfo();
         }
         ConfigChanged();
@@ -4191,12 +4153,6 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     }
 
     GpuObjectAttach(resid, obj);
-    DbgPrint(TRACE_LEVEL_FATAL,
-             ("CreateFB scanout %u resid %u (%dx%d) -> SetScanout\n",
-              scanId,
-              resid,
-              pModeInfo->VisScreenWidth,
-              pModeInfo->VisScreenHeight));
     m_CtrlQueue.SetScanout(scanId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.ResFlush(resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);

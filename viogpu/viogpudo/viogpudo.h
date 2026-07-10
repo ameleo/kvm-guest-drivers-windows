@@ -86,7 +86,7 @@ class VioGpuAdapter : IVioGpuPCI
                            DEVICE_POWER_STATE DevicePowerState,
                            CURRENT_MODE *pCurrentMode);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
-    void ArmInitialScan(void);   // called by VioGpuDod::StartDevice once the driver is active
+    void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);
     NTSTATUS ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
                                        _In_ UINT DstBitPerPixel,
@@ -190,8 +190,6 @@ class VioGpuAdapter : IVioGpuPCI
     void static ThreadWork(_In_ PVOID Context);
     void ThreadWorkRoutine(void);
     void ConfigChanged(void);
-    void static InitialScanDpc(_In_ struct _KDPC *Dpc, _In_opt_ PVOID Context, _In_opt_ PVOID Arg1,
-                               _In_opt_ PVOID Arg2);
     NTSTATUS VirtIoDeviceInit(void);
     VOID CreateResolutionEvent(VOID);
     VOID NotifyResolutionEvent(VOID);
@@ -226,14 +224,13 @@ class VioGpuAdapter : IVioGpuPCI
     KEVENT m_ConfigUpdateEvent;
     PETHREAD m_pWorkThread;
     BOOLEAN m_bStopWorkThread;
-    // Post-start deferred re-scan. The host may enable a secondary head "très tôt" (before StartDevice makes the
-    // driver active); GetDisplayInfo's boot-latch keeps it disconnected because no DxgkCbIndicateChildStatus arrival
-    // is legal mid-Start. Armed at the end of StartDevice, this one-shot timer fires once the driver is fully active
-    // and signals the worker to re-run GetDisplayInfo, turning the still-enabled secondary into a proper hotplug
-    // arrival -> Windows extends. QEMU never re-notifies (its size is static), so the driver self-triggers this.
-    KTIMER m_InitialScanTimer;
-    KDPC m_InitialScanDpc;
+    // One-shot post-start scan. A secondary the host enabled at boot is kept at the HWInit seed (disconnected) --
+    // no DxgkCbIndicateChildStatus arrival is legal before the driver is active. On the FIRST VidPN commit (Windows
+    // has composed its boot topology), CommitVidPn calls TriggerInitialScan, which signals the worker to re-run
+    // GetDisplayInfo and indicate the secondary as a hotplug arrival -> Windows extends. m_bInitialScanArmed makes
+    // it fire exactly once; QEMU never re-notifies (static size), so this driver-side trigger is what drives it.
     volatile LONG m_InitialScanPending;
+    BOOLEAN m_bInitialScanArmed;
     PKEVENT m_ResolutionEvent;
     HANDLE m_ResolutionEventHandle;
 };
