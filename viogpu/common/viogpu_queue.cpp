@@ -300,7 +300,11 @@ BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
     PGPU_CMD_GET_EDID cmd = (PGPU_CMD_GET_EDID)buf->buf;
     PGPU_RESP_EDID resp = (PGPU_RESP_EDID)buf->resp_buf;
-    PUCHAR resp_edit = (PUCHAR)(resp->edid + (ULONGLONG)id * EDID_V1_BLOCK_SIZE);
+    // The GET_EDID response carries ONLY the requested scanout's EDID at resp->edid[0]; it is NOT an array
+    // indexed by scanout (the scanout is passed in the COMMAND). The old "+ id * EDID_V1_BLOCK_SIZE" offset
+    // read past the block for any scanout > 0 (zeros -> no 00 FF FF header -> reported "blank") -- a bug the
+    // mono-head driver never hit because it only ever queried scanout 0 (offset 0). Read from offset 0.
+    PUCHAR resp_edit = (PUCHAR)(resp->edid);
     if (resp->hdr.type != VIRTIO_GPU_RESP_OK_EDID)
     {
         DbgPrint(TRACE_LEVEL_VERBOSE, (" %s type = %x: disabled\n", __FUNCTION__, resp->hdr.type));
