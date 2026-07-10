@@ -3360,6 +3360,13 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             // re-notifies (static size), so the one-shot post-start scan self-triggers that arrival.
             if (m_pVioGpuDod->IsDriverActive())
             {
+                if (wantConnected && i != 0)
+                {
+                    // Arrival: pick up this head's REAL host EDID now that it is enabled (the host may have had only
+                    // a blank block at boot -> GetEdids fell back to a copy of the primary's). Do it BEFORE the
+                    // indicate so Windows reads the fresh descriptor on QueryDeviceDescriptor. No-op if still blank.
+                    RefreshEdid(i);
+                }
                 UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates the hotplug arrival/departure
                 if (!wantConnected)
                 {
@@ -3472,6 +3479,50 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
+}
+
+BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
+{
+    PAGED_CODE();
+    // Re-read a secondary head's REAL host EDID when it is (re)enabled. At boot a not-yet-configured scanout hands
+    // back a blank block, so GetEdids fell back to a copy of the primary's EDID. Once the host enables the head it
+    // can provide a real EDID for that scanout -- carrying the head's own native modes and, when the server pushes
+    // physical dimensions, the correct DPI. Prefer that over the copy-of-primary. Purely additive: if the host is
+    // still blank we keep whatever we already have (never clobber the boot EDID with a blank).
+    if (scanId == 0 || scanId >= GetNumScanouts())
+    {
+        return FALSE;
+    }
+    static const BYTE edid_magic[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    BYTE tmp[EDID_RAW_BLOCK_SIZE] = {0};
+    PGPU_VBUFFER vbuf = NULL;
+    BOOLEAN got = FALSE;
+
+    BOOLEAN haveTmp = (m_CtrlQueue.AskEdidInfo(&vbuf, scanId) && m_CtrlQueue.GetEdidInfo(vbuf, scanId, tmp));
+    BOOLEAN validTmp = haveTmp && RtlCompareMemory(tmp, edid_magic, sizeof(edid_magic)) == sizeof(edid_magic);
+    if (!validTmp)
+    {
+    }
+    if (validTmp)
+    {
+        // EDID bytes 21/22 = max horizontal/vertical image size in CM (the physical size that drives DPI). Logging
+        // them tells us whether the host's per-scanout width_mm/height_mm actually reached the generated EDID.
+        RtlCopyMemory(m_EDIDs[scanId], tmp, EDID_RAW_BLOCK_SIZE);
+        // Distinctness safety: if a generic host hands the SAME identity block to every scanout (manufacturer +
+        // product + serial, bytes 8..15, identical to the primary), Windows would conflate the two monitors
+        // (the non-deterministic "show only on X"). Nudge product code + serial only in that collision case;
+        // a host that already gives distinct/real EDIDs is used verbatim.
+        if (m_bEDID[0] && RtlCompareMemory(&m_EDIDs[scanId][8], &m_EDIDs[0][8], 8) == 8)
+        {
+            m_EDIDs[scanId][10] = (BYTE)(m_EDIDs[scanId][10] + scanId);       // product code low byte
+            m_EDIDs[scanId][12] = (BYTE)(m_EDIDs[scanId][12] + scanId);       // serial byte
+            m_EDIDs[scanId][127] = (BYTE)(m_EDIDs[scanId][127] - 2 * scanId); // keep block-0 checksum == 0
+        }
+        m_bEDID[scanId] = TRUE;
+        got = TRUE;
+    }
+    m_CtrlQueue.ReleaseBuffer(vbuf);
+    return got;
 }
 
 BOOLEAN VioGpuAdapter::UpdateModes(USHORT xres, USHORT yres, int &cnt)
