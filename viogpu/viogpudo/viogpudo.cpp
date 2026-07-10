@@ -411,17 +411,21 @@ NTSTATUS VioGpuDod::QueryChildRelations(_Out_writes_bytes_(ChildRelationsSize) D
 
     for (UINT ChildIndex = 0; ChildIndex < ChildRelationsCount; ++ChildIndex)
     {
-        // Only the PRIMARY (scanout 0) is the VGA post-display output → always-connected / internal panel. The
-        // SECONDARY heads are HOTPLUGGABLE: report them Interruptible + external (HD15) so Windows HONORS their
-        // QueryChildStatus (connect/disconnect from m_bConnected). Reporting AlwaysConnected/INTERNAL for a
-        // secondary made Windows treat it as a soldered panel and IGNORE QueryChildStatus entirely — so it stayed
-        // connected regardless of GET_DISPLAY_INFO enabled=0 and a refused EDID → phantom 2nd monitor at boot.
+        // Only the PRIMARY (scanout 0) is the VGA post-display output → always-connected. The SECONDARY heads are
+        // HOTPLUGGABLE: report them Interruptible so Windows HONORS their QueryChildStatus (connect/disconnect from
+        // m_bConnected). Reporting AlwaysConnected for a secondary made Windows treat it as a soldered panel and
+        // IGNORE QueryChildStatus entirely — so it stayed connected regardless of GET_DISPLAY_INFO enabled=0 and a
+        // refused EDID → phantom 2nd monitor at boot.
         BOOLEAN primaryVga = (ChildIndex == 0) && IsVgaDevice();
         pChildRelations[ChildIndex].ChildDeviceType = TypeVideoOutput;
         pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = primaryVga ? HpdAwarenessAlwaysConnected
                                                                                 : HpdAwarenessInterruptible;
-        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = primaryVga ? D3DKMDT_VOT_INTERNAL
-                                                                                                        : D3DKMDT_VOT_HD15;
+        // EXTERNAL (HD15) for EVERY head, primary included — NEVER D3DKMDT_VOT_INTERNAL. An internal primary makes
+        // Windows model the guest as a LAPTOP (built-in panel + external monitors) and apply the Win+P projection
+        // logic → a newly-arrived head lands on "show only on" / duplicate instead of extending. All-external =
+        // a desktop multi-monitor rig → Windows auto-extends a new monitor by default. Only the interface type is
+        // uniform now; HpdAwareness still differs (primary always-connected VGA, secondaries hotpluggable).
+        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_HD15;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
         pChildRelations[ChildIndex].AcpiUid = 0;
@@ -684,7 +688,16 @@ NTSTATUS VioGpuDod::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_P
         SetPowerState(TargetId, PowerDeviceD0, PowerActionNone);
     }
 
+    // m_CurrentMode is indexed by source: find the one shown on TargetId (they differ after "second screen only").
     UINT scanId = (TargetId < MAX_VIEWS) ? (UINT)TargetId : 0;
+    for (UINT src = 0; src < MAX_VIEWS; src++)
+    {
+        if (m_CurrentMode[src].DispInfo.TargetId == TargetId)
+        {
+            scanId = src;
+            break;
+        }
+    }
     m_pHWDevice->BlackOutScreen(&m_CurrentMode[scanId]);
     DbgPrint(TRACE_LEVEL_FATAL,
              ("StopDeviceAndReleasePostDisplayOwnership Width = %d Height = %d Pitch = %d ColorFormat = %dn",
@@ -1032,14 +1045,38 @@ NTSTATUS VioGpuDod::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTER
     PAGED_CODE();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-    UNREFERENCED_PARAMETER(pVidPnPinnedSourceModeInfo);
+    UNREFERENCED_PARAMETER(SourceId);
 
     D3DKMDT_VIDPN_TARGET_MODE *pVidPnTargetModeInfo = NULL;
     NTSTATUS Status = STATUS_SUCCESS;
 
-    for (UINT ModeIndex = 0; ModeIndex < m_pHWDevice->GetModeCount(); ++ModeIndex)
+    // SUPERSET of target modes: when the OS pinned a SOURCE mode, a target of EXACTLY that size first (marked
+    // PREFERRED), then every supported mode. The equal-size target guarantees a pinned commit matches with
+    // IDENTITY scaling (never source!=target), and the full list keeps a commit of ANY size possible — the
+    // client-driven resizes are arbitrary sizes. Two dead ends, documented so nobody retries them: a pinned-only
+    // set broke custom-size resizes (no cofunctional target for sizes outside the pinned one), and the MS-sample
+    // semantics (single target = current committed mode) produced source!=target commits through CENTERED
+    // scaling that this driver's commit path does not handle (stride shear). The one leftover is cosmetic: the
+    // "active signal mode" Windows shows may lag or pick a stale mode; fixing that for real means teaching the
+    // commit path about source!=target first.
+    VIDEO_MODE_INFORMATION pinnedModeInfo;
+    UINT extraPinned = 0;
+    if (pVidPnPinnedSourceModeInfo != NULL)
     {
-        PVIDEO_MODE_INFORMATION pModeInfo = m_pHWDevice->GetModeInfo(SourceId);
+        RtlZeroMemory(&pinnedModeInfo, sizeof(pinnedModeInfo));
+        pinnedModeInfo.VisScreenWidth = pVidPnPinnedSourceModeInfo->Format.Graphics.VisibleRegionSize.cx;
+        pinnedModeInfo.VisScreenHeight = pVidPnPinnedSourceModeInfo->Format.Graphics.VisibleRegionSize.cy;
+        extraPinned = 1;
+    }
+
+    const UINT modeCount = m_pHWDevice->GetModeCount() + extraPinned;
+    for (UINT ModeIndex = 0; ModeIndex < modeCount; ++ModeIndex)
+    {
+        // Index 0 = the pinned-size mode (when present), then the full mode list. A duplicate of the pinned size
+        // in the list is rejected by pfnAddMode as ALREADY_IN_MODESET, which the loop already tolerates.
+        PVIDEO_MODE_INFORMATION pModeInfo = (extraPinned != 0 && ModeIndex == 0)
+                                                ? &pinnedModeInfo
+                                                : m_pHWDevice->GetModeInfo(ModeIndex - extraPinned);
         pVidPnTargetModeInfo = NULL;
         Status = pVidPnTargetModeSetInterface->pfnCreateNewModeInfo(hVidPnTargetModeSet, &pVidPnTargetModeInfo);
         if (!NT_SUCCESS(Status))
@@ -1052,7 +1089,9 @@ NTSTATUS VioGpuDod::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTER
         }
         BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);   // sets ActiveSize itself now
 
-        if (pModeInfo->VisScreenWidth == NOM_WIDTH_SIZE && pModeInfo->VisScreenHeight == NOM_HEIGHT_SIZE)
+        if ((extraPinned != 0 && ModeIndex == 0) ||
+            (extraPinned == 0 && pModeInfo->VisScreenWidth == NOM_WIDTH_SIZE &&
+             pModeInfo->VisScreenHeight == NOM_HEIGHT_SIZE))
         {
             pVidPnTargetModeInfo->Preference = D3DKMDT_MP_PREFERRED;
         }
@@ -2794,7 +2833,18 @@ PBYTE VioGpuAdapter::GetEdidData(UINT scanId)
     {
         scanId = 0;
     }
-    return m_bEDID[scanId] ? m_EDIDs[scanId] : (PBYTE)(g_gpu_edid);
+    if (m_bEDID[scanId])
+    {
+        return m_EDIDs[scanId];
+    }
+    // A secondary without a host EDID gets its own copy of the built-in one, with a distinct identity, once
+    // GetEdids has prepared it.
+    static const BYTE edid_magic[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    if (scanId > 0 && RtlCompareMemory(m_EDIDs[scanId], edid_magic, sizeof(edid_magic)) == sizeof(edid_magic))
+    {
+        return m_EDIDs[scanId];
+    }
+    return (PBYTE)(g_gpu_edid);
 }
 
 // Refresh rate derived from the FIRST detailed timing descriptor of the host EDID: the host authors the EDID
@@ -3222,7 +3272,7 @@ BOOLEAN FindUpdateRect(_In_ ULONG NumMoves,
     return updated;
 }
 
-UINT ColorFormat(UINT format);   // forward decl (defined below) — used by the blob flip in the present
+UINT ColorFormat(UINT format);
 
 NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
                                                   _In_ UINT DstBitPerPixel,
@@ -3777,6 +3827,13 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             // re-notifies (static size), so the one-shot post-start scan self-triggers that arrival.
             if (m_pVioGpuDod->IsDriverActive())
             {
+                if (wantConnected && i != 0)
+                {
+                    // Arrival: pick up this head's REAL host EDID now that it is enabled (the host may have had only
+                    // a blank block at boot -> GetEdids fell back to a copy of the primary's). Do it BEFORE the
+                    // indicate so Windows reads the fresh descriptor on QueryDeviceDescriptor. No-op if still blank.
+                    RefreshEdid(i);
+                }
                 UpdateChildStatus(i, wantConnected);   // updates m_bConnected + indicates the hotplug arrival/departure
                 if (!wantConnected)
                 {
@@ -3808,7 +3865,9 @@ int VioGpuAdapter::ProcessEdid(void)
     }
     else
     {
+        // edid=off: the built-in EDID, cleaned by FixEdid, then a copy with its own identity for each secondary.
         FixEdid();
+        MakeBuiltinEdidCopies();
     }
 
     return AddEdidModes();
@@ -3833,6 +3892,29 @@ void VioGpuAdapter::FixEdid(void)
     pdata->Checksum[0] = -Sum;
 }
 
+// Block-0 checksum: its 128 bytes must sum to 0 (mod 256), byte 127 included. Only block 0 is ever modified,
+// so an extension block keeps its own checksum.
+static void FixEdidChecksum(BYTE *edid)
+{
+    BYTE sum = 0;
+    for (int i = 0; i < EDID_V1_BLOCK_SIZE - 1; ++i)
+    {
+        sum = (BYTE)(sum + edid[i]);
+    }
+    edid[EDID_V1_BLOCK_SIZE - 1] = (BYTE)(0x100 - sum);
+}
+
+// A copy the driver makes of an EDID (the primary's host EDID for a head the host gave none, or the built-in one)
+// carries the original's identity. Give head i its own product code and serial (bytes 10 and 12), so Windows does
+// not conflate the copies with the original: with only the serial differing, it restored the extended arrangement
+// at random. The host's own EDIDs are used as they are.
+static void NudgeEdidIdentity(BYTE *edid, UINT32 head)
+{
+    edid[10] = (BYTE)(edid[10] + head); // product code low byte (distinct model)
+    edid[12] = (BYTE)(edid[12] + head); // serial byte
+    FixEdidChecksum(edid);
+}
+
 BOOLEAN VioGpuAdapter::GetEdids(void)
 {
     PAGED_CODE();
@@ -3845,6 +3927,10 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
 
     for (UINT32 i = 0; i < numScanouts; i++)
     {
+        // Reset per iteration: AskEdidInfo leaves *buf untouched when it fails (e.g. response
+        // allocation), so without this the ReleaseBuffer below would free the previous
+        // iteration's already-freed buffer (double-free), or NULL on the first scanout.
+        vbuf = NULL;
         // Store each scanout's EDID in its OWN slot: a single shared buffer would let
         // a blank secondary EDID clobber the primary's, leaving both monitors
         // identical / without modes.
@@ -3863,7 +3949,10 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
         else
         {
         }
-        m_CtrlQueue.ReleaseBuffer(vbuf);
+        if (vbuf != NULL)
+        {
+            m_CtrlQueue.ReleaseBuffer(vbuf);
+        }
     }
 
     // Any head that has no real EDID gets a COPY of the primary's (so it exposes
@@ -3881,16 +3970,70 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
             if (!m_bEDID[i])
             {
                 RtlCopyMemory(m_EDIDs[i], m_EDIDs[0], EDID_RAW_BLOCK_SIZE);
-                m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i);       // product code low byte (distinct model)
-                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
-                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
+                NudgeEdidIdentity(m_EDIDs[i], i);
                 m_bEDID[i] = TRUE;
             }
         }
     }
 
+    MakeBuiltinEdidCopies();
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
+}
+
+// Without a host EDID for the primary (edid=off, or GET_EDID failed) every head would expose the same built-in
+// EDID, and Windows would conflate the monitors. Give each secondary its own copy of it, with a distinct identity
+// nudged like the copy of the primary's host EDID. m_bEDID stays FALSE, since it means "the host gave this head an
+// EDID" to the mode and refresh-rate logic. GetEdidData returns these copies.
+void VioGpuAdapter::MakeBuiltinEdidCopies(void)
+{
+    PAGED_CODE();
+    if (m_bEDID[0])
+    {
+        return;
+    }
+    for (UINT32 i = 1; i < GetNumScanouts(); i++)
+    {
+        if (!m_bEDID[i])
+        {
+            RtlZeroMemory(m_EDIDs[i], EDID_RAW_BLOCK_SIZE);
+            RtlCopyMemory(m_EDIDs[i], g_gpu_edid, EDID_V1_BLOCK_SIZE);
+            NudgeEdidIdentity(m_EDIDs[i], i);
+        }
+    }
+}
+
+BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
+{
+    PAGED_CODE();
+    // Re-read a secondary head's REAL host EDID when it is (re)enabled. At boot a not-yet-configured scanout hands
+    // back a blank block, so GetEdids fell back to a copy of the primary's EDID. Once the host enables the head it
+    // can provide a real EDID for that scanout -- carrying the head's own native modes and, when the server pushes
+    // physical dimensions, the correct DPI. Prefer that over the copy-of-primary. Purely additive: if the host is
+    // still blank we keep whatever we already have (never clobber the boot EDID with a blank).
+    if (scanId == 0 || scanId >= GetNumScanouts())
+    {
+        return FALSE;
+    }
+    static const BYTE edid_magic[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    BYTE tmp[EDID_RAW_BLOCK_SIZE] = {0};
+    PGPU_VBUFFER vbuf = NULL;
+    BOOLEAN got = FALSE;
+
+    BOOLEAN haveTmp = (m_CtrlQueue.AskEdidInfo(&vbuf, scanId) && m_CtrlQueue.GetEdidInfo(vbuf, scanId, tmp));
+    BOOLEAN validTmp = haveTmp && RtlCompareMemory(tmp, edid_magic, sizeof(edid_magic)) == sizeof(edid_magic);
+    if (validTmp)
+    {
+        RtlCopyMemory(m_EDIDs[scanId], tmp, EDID_RAW_BLOCK_SIZE);
+        m_bEDID[scanId] = TRUE;
+        got = TRUE;
+    }
+    if (vbuf != NULL)
+    {
+        m_CtrlQueue.ReleaseBuffer(vbuf);
+    }
+    return got;
 }
 
 BOOLEAN VioGpuAdapter::UpdateModes(USHORT xres, USHORT yres, int &cnt)
