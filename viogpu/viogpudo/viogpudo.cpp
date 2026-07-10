@@ -3485,6 +3485,10 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
 
     for (UINT32 i = 0; i < numScanouts; i++)
     {
+        // Reset per iteration: AskEdidInfo leaves *buf untouched when it fails (e.g. response
+        // allocation), so without this the ReleaseBuffer below would free the previous
+        // iteration's already-freed buffer (double-free), or NULL on the first scanout.
+        vbuf = NULL;
         // Store each scanout's EDID in its OWN slot: a single shared buffer would let
         // a blank secondary EDID clobber the primary's, leaving both monitors
         // identical / without modes.
@@ -3503,7 +3507,10 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
         else
         {
         }
-        m_CtrlQueue.ReleaseBuffer(vbuf);
+        if (vbuf != NULL)
+        {
+            m_CtrlQueue.ReleaseBuffer(vbuf);
+        }
     }
 
     // Any head that has no real EDID gets a COPY of the primary's (so it exposes
@@ -3573,7 +3580,10 @@ BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
         m_bEDID[scanId] = TRUE;
         got = TRUE;
     }
-    m_CtrlQueue.ReleaseBuffer(vbuf);
+    if (vbuf != NULL)
+    {
+        m_CtrlQueue.ReleaseBuffer(vbuf);
+    }
     return got;
 }
 
