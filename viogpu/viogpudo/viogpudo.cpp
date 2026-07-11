@@ -3131,7 +3131,11 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
 
         crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
         crsr->resource_id = m_pCursorBuf->GetId();
-        crsr->pos.scanout_id = (ULONG)pModeCur->DispInfo.TargetId;
+        // Target the head DXGK named (VidPnSourceId), NOT pModeCur->DispInfo.TargetId: in the 1:1:1 extend
+        // mapping source id == scanout id, and the dispatcher already bounded VidPnSourceId < GetNumScanouts().
+        // DispInfo.TargetId stays D3DDDI_ID_UNINITIALIZED (0xFFFFFFFF) for a head until a commit/resize sets it
+        // (never for the primary in some paths) → the cursor landed on scanout 0xFFFFFFFF and vanished.
+        crsr->pos.scanout_id = (ULONG)pSetPointerShape->VidPnSourceId;
         crsr->pos.x = 0;
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
@@ -3197,7 +3201,9 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             UINT ret = 0;
             crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
             RtlZeroMemory(crsr, sizeof(*crsr));
-            crsr->pos.scanout_id = (ULONG)pModeCur->DispInfo.TargetId;
+            // Head index from DXGK (bounded < GetNumScanouts() by the dispatcher), not the possibly-uninitialized
+            // pModeCur->DispInfo.TargetId — see SetPointerShape for the rationale.
+            crsr->pos.scanout_id = (ULONG)pSetPointerPosition->VidPnSourceId;
 
             if (!visible)
             {
