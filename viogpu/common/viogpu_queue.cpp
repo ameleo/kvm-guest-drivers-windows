@@ -394,18 +394,31 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
         // cursor image (issue #977). Completing the transfer on the control
         // queue guarantees the resource is up to date when UPDATE_CURSOR runs.
         KEVENT event;
+        NTSTATUS status;
         KeInitializeEvent(&event, NotificationEvent, FALSE);
         vbuf->complete_cb = NotifyEventCompleteCB;
         vbuf->complete_ctx = &event;
         vbuf->auto_release = false;
 
+        // Bounded wait with a 100 ms safety net. An INFINITE wait was tried (to close a latent UAF: a late
+        // completion after a timeout would KeSetEvent the on-stack event) but it HANGS boot on this path --
+        // the cursor transfer rides the ctrl queue during multi-head bring-up and a stall left SetPointerShape
+        // blocked forever, so the second head's VidPN commit never ran (primary up, secondary lost). Restore
+        // the timeout that shipped known-good; on timeout, LEAK the buffer rather than free one the device may
+        // still own. (Proper fix: a heap-allocated event the completion frees -> safe AND cannot hang. TODO.)
+        LARGE_INTEGER timeout = {0};
+        timeout.QuadPart = Int32x32To64(100, -10000); // 100 ms safety net
+
         QueueBuffer(vbuf);
-        // Wait INFINITE, never with a timeout: complete_ctx points at the on-stack event above,
-        // so returning (and unwinding the stack) while the buffer is still in flight would let a
-        // later completion KeSetEvent a dead stack address -> memory corruption. The device applies
-        // this transfer promptly; the upstream Ask* helpers wait the same way.
-        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-        ReleaseBuffer(vbuf);
+        status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+        if (status == STATUS_TIMEOUT)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s transfer wait timed out\n", __FUNCTION__));
+        }
+        else
+        {
+            ReleaseBuffer(vbuf);
+        }
     }
     else
     {
