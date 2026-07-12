@@ -218,6 +218,13 @@ class VioGpuAdapter : IVioGpuPCI
     VioGpuBuf m_GpuBuf;
     VioGpuIdr m_Idr;
     VioGpuObj *m_pFrameBuf[MAX_SCANOUTS];
+    // Serialises each scanout's framebuffer object between the present/blackout readers (which deref
+    // m_pFrameBuf[scanId]->GetId() and issue the host transfer) and the hotplug/mode/power writers (which
+    // delete the object and recycle its resource id). Per-scanout so heads never block each other. Guarded (not
+    // fast) mutex: it stays at PASSIVE_LEVEL, so it is safe to hold across the control-queue waits. Every
+    // accessor runs at PASSIVE; the bugcheck path (ResetToVgaMode, bKeepBuffer=TRUE) keeps the buffer and skips
+    // the lock. See DestroyFrameBufferObj / ExecutePresentDisplayOnly.
+    KGUARDED_MUTEX m_FrameBufLock[MAX_SCANOUTS];
     VioGpuObj *m_pCursorBuf;
     VioGpuMemSegment m_CursorSegment;
     VioGpuMemSegment m_FrameSegment[MAX_SCANOUTS];
