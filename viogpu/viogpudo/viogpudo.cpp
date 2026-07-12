@@ -2395,6 +2395,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_ModeCount = 0;
     m_Id = g_InstanceId++;
     RtlZeroMemory(m_pFrameBuf, sizeof(m_pFrameBuf));
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+        KeInitializeGuardedMutex(&m_FrameBufLock[scan]);
     m_pCursorBuf = NULL;
     KeInitializeGuardedMutex(&m_CursorMutex);
     // No sprite is attached until the first shape is set.
@@ -3028,8 +3030,13 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
     // Without this, presenting to a secondary head would flush scanout 0's
     // resource -> the secondary head stays black.
     UINT scanId = (pModeCur->DispInfo.TargetId < MAX_SCANOUTS) ? (UINT)pModeCur->DispInfo.TargetId : 0;
+    // Hold this scanout's lock across the deref + host transfer: a concurrent hotplug/mode/power writer must not
+    // delete the object (UAF on GetId) or DestroyResource/recycle its id mid-transfer. (The BltBits above wrote
+    // to the persistent segment memory, not the object, so it stays outside the lock.)
+    KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);
     if (m_pFrameBuf[scanId] == NULL)
     {
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
         DbgPrint(TRACE_LEVEL_WARNING, ("present scanout %u has no framebuffer\n", scanId));
         return STATUS_UNSUCCESSFUL;
     }
@@ -3053,6 +3060,7 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
                                  updrect.left,
                                  updrect.top);
     m_CtrlQueue.ResFlush(resid, updrect.right - updrect.left, updrect.bottom - updrect.top, updrect.left, updrect.top);
+    KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
 
     return STATUS_SUCCESS;
 }
@@ -3079,8 +3087,10 @@ VOID VioGpuAdapter::BlackOutScreen(CURRENT_MODE *pCurrentMod)
         // FIXME!!! rotation
 
         UINT scanId = (pCurrentMod->DispInfo.TargetId < MAX_SCANOUTS) ? (UINT)pCurrentMod->DispInfo.TargetId : 0;
+        KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);   // same reader/writer race as ExecutePresentDisplayOnly
         if (m_pFrameBuf[scanId] == NULL)
         {
+            KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
             DbgPrint(TRACE_LEVEL_WARNING, ("blackout scanout %u has no framebuffer\n", scanId));
             return;
         }
@@ -3088,6 +3098,7 @@ VOID VioGpuAdapter::BlackOutScreen(CURRENT_MODE *pCurrentMod)
 
         m_CtrlQueue.TransferToHost2D(resid, 0UL, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
         m_CtrlQueue.ResFlush(resid, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -3990,6 +4001,12 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s scan %d\n", __FUNCTION__, scanId));
     UINT resid = 0;
 
+    // Serialise against the present/blackout readers so they never deref a deleted object or transfer to a
+    // recycled id. bKeepBuffer marks the bugcheck flow (ResetToVgaMode): it can run at high IRQL and keeps the
+    // object anyway, so it must NOT take the guarded mutex.
+    const BOOLEAN useLock = !bKeepBuffer;
+    if (useLock)
+        KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);
     if (m_pFrameBuf[scanId] != NULL)
     {
         resid = (UINT)m_pFrameBuf[scanId]->GetId();
@@ -4012,6 +4029,8 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
         m_pFrameBuf[scanId] = NULL;
         m_Idr.PutId(resid);
     }
+    if (useLock)
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
@@ -4254,6 +4273,9 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_INFORMATION,
              ("---> %s - %d: scan %d (%d x %d)\n", __FUNCTION__, m_Id, scanId, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight));
+    // Hold the scanout lock while we build and publish m_pFrameBuf[scanId], so it is serialised against a
+    // concurrent hotplug-disconnect DestroyFrameBufferObj and against the present/blackout readers.
+    KeAcquireGuardedMutex(&m_FrameBufLock[scanId]);
     ASSERT(m_pFrameBuf[scanId] == NULL);
     size = pModeInfo->ScreenStride * pModeInfo->VisScreenHeight;
     format = ColorFormat(pCurrentMode->DispInfo.ColorFormat);
@@ -4268,6 +4290,7 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
         m_CtrlQueue.DestroyResource(resid);
         m_Idr.PutId(resid);
         delete obj;
+        KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
         return FALSE;
     }
 
@@ -4278,6 +4301,7 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     m_pFrameBuf[scanId] = obj;
     pCurrentMode->FrameBuffer = obj->GetVirtualAddress();
     pCurrentMode->Flags.FrameBufferIsActive = TRUE;
+    KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
 }
