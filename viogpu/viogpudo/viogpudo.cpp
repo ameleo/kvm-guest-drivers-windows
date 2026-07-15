@@ -1814,7 +1814,8 @@ NTSTATUS VioGpuDod::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourc
     UINT srcId = (UINT)pPath->VidPnSourceId;
     UINT scanId = (pPath->VidPnTargetId < MAX_SCANOUTS) ? (UINT)pPath->VidPnTargetId : 0;
     CURRENT_MODE *pCurrentMode = &m_CurrentMode[srcId];
-    pCurrentMode->DispInfo.TargetId = scanId;
+    const UINT reqW = pSourceMode->Format.Graphics.PrimSurfSize.cx;
+    const UINT reqH = pSourceMode->Format.Graphics.PrimSurfSize.cy;
     DbgPrint(TRACE_LEVEL_FATAL,
              ("---> %s src %d scan %d (%dx%d)\n",
               __FUNCTION__,
@@ -1822,36 +1823,43 @@ NTSTATUS VioGpuDod::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourc
               scanId,
               pSourceMode->Format.Graphics.VisibleRegionSize.cx,
               pSourceMode->Format.Graphics.VisibleRegionSize.cy));
-    pCurrentMode->Scaling = pPath->ContentTransformation.Scaling;
-    pCurrentMode->SrcModeWidth = pSourceMode->Format.Graphics.VisibleRegionSize.cx;
-    pCurrentMode->SrcModeHeight = pSourceMode->Format.Graphics.VisibleRegionSize.cy;
-    pCurrentMode->Rotation = pPath->ContentTransformation.Rotation;
 
-    pCurrentMode->DispInfo.Width = pSourceMode->Format.Graphics.PrimSurfSize.cx;
-    pCurrentMode->DispInfo.Height = pSourceMode->Format.Graphics.PrimSurfSize.cy;
-    pCurrentMode->DispInfo.Pitch = pSourceMode->Format.Graphics.PrimSurfSize.cx *
-                                   BPPFromPixelFormat(pCurrentMode->DispInfo.ColorFormat) / BITS_PER_BYTE;
-
-    if (NT_SUCCESS(Status))
+    // Commit the mode ATOMICALLY, and ONLY if an enumerated mode backs the requested primary-surface size.
+    // DispInfo.Width/Height is the critical field: the Present/BlackOut transfer uses it, and the host resource is
+    // sized from the SAME mode (SetCurrentMode -> CreateFrameBufferObj). The old code updated DispInfo BEFORE
+    // checking for a backing mode, so a request whose size is NOT in the list -- a stale custom slot during a rapid
+    // resize thrash -- left DispInfo AHEAD of the actual resource. TRANSFER_TO_HOST_2D then exceeded the resource ->
+    // VIRTIO_GPU_RESP_ERR (0x1200) storm on every present. So find the mode first; only then touch state.
+    for (USHORT ModeIndex = 0; ModeIndex < m_pHWDevice->GetModeCount(); ++ModeIndex)
     {
-        pCurrentMode->Flags.FullscreenPresent = TRUE;
-        for (USHORT ModeIndex = 0; ModeIndex < m_pHWDevice->GetModeCount(); ++ModeIndex)
+        PVIDEO_MODE_INFORMATION pModeInfo = m_pHWDevice->GetModeInfo(ModeIndex);
+        if (reqW == pModeInfo->VisScreenWidth && reqH == pModeInfo->VisScreenHeight)
         {
-            PVIDEO_MODE_INFORMATION pModeInfo = m_pHWDevice->GetModeInfo(ModeIndex);
-            if (pCurrentMode->DispInfo.Width == pModeInfo->VisScreenWidth &&
-                pCurrentMode->DispInfo.Height == pModeInfo->VisScreenHeight)
+            pCurrentMode->DispInfo.TargetId = scanId;
+            pCurrentMode->Scaling = pPath->ContentTransformation.Scaling;
+            pCurrentMode->SrcModeWidth = pSourceMode->Format.Graphics.VisibleRegionSize.cx;
+            pCurrentMode->SrcModeHeight = pSourceMode->Format.Graphics.VisibleRegionSize.cy;
+            pCurrentMode->Rotation = pPath->ContentTransformation.Rotation;
+            pCurrentMode->DispInfo.Width = reqW;
+            pCurrentMode->DispInfo.Height = reqH;
+            pCurrentMode->DispInfo.Pitch = reqW * BPPFromPixelFormat(pCurrentMode->DispInfo.ColorFormat) / BITS_PER_BYTE;
+            pCurrentMode->Flags.FullscreenPresent = TRUE;
+            Status = m_pHWDevice->SetCurrentMode(m_pHWDevice->GetModeNumber(ModeIndex), pCurrentMode, scanId);
+            if (NT_SUCCESS(Status))
             {
-                Status = m_pHWDevice->SetCurrentMode(m_pHWDevice->GetModeNumber(ModeIndex), pCurrentMode, scanId);
-                if (NT_SUCCESS(Status))
-                {
-                    m_pHWDevice->SetCurrentModeIndex(scanId, ModeIndex);
-                }
-                break;
+                m_pHWDevice->SetCurrentModeIndex(scanId, ModeIndex);
             }
+            return Status;
         }
     }
 
-    return Status;
+    // No enumerated mode backs the requested size (stale custom slot mid-resize). Leave pCurrentMode on its
+    // previous, still-backed size and FAIL the commit so dxgkrnl re-evaluates with a current mode -- never desync
+    // DispInfo from the host resource (which is what triggered the TRANSFER_TO_HOST_2D UNSPEC storm).
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("<--- %s: no enumerated mode backs %ux%u on scan %d -- refusing (avoids resource desync)\n",
+              __FUNCTION__, reqW, reqH, scanId));
+    return STATUS_UNSUCCESSFUL;
 }
 
 NTSTATUS VioGpuDod::IsVidPnPathFieldsValid(CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath) const
@@ -2391,6 +2399,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
     RtlZeroMemory(m_bEDID, sizeof(m_bEDID));
     RtlZeroMemory(m_bConnected, sizeof(m_bConnected));
+    RtlZeroMemory(m_FrameBufW, sizeof(m_FrameBufW));
+    RtlZeroMemory(m_FrameBufH, sizeof(m_FrameBufH));
     m_ModeInfo = NULL;
     m_ModeCount = 0;
     m_Id = g_InstanceId++;
@@ -3059,13 +3069,27 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
               pModeCur->SrcModeWidth,
               pModeCur->SrcModeHeight));
 
-    m_CtrlQueue.TransferToHost2D(resid,
-                                 offset,
-                                 updrect.right - updrect.left,
-                                 updrect.bottom - updrect.top,
-                                 updrect.left,
-                                 updrect.top);
-    m_CtrlQueue.ResFlush(resid, updrect.right - updrect.left, updrect.bottom - updrect.top, updrect.left, updrect.top);
+    // Guard: never let a stale mode make the transfer overrun the host resource (→ VIRTIO_GPU_RESP_ERR storm).
+    // SetSourceModeAndPath is now atomic so DispInfo can't run ahead of the resource, but this is a cheap belt
+    // against ANY residual desync — skip the present rather than flood the control queue with rejected commands.
+    if (updrect.right <= (LONG)m_FrameBufW[scanId] && updrect.bottom <= (LONG)m_FrameBufH[scanId] &&
+        updrect.right > updrect.left && updrect.bottom > updrect.top)
+    {
+        m_CtrlQueue.TransferToHost2D(resid,
+                                     offset,
+                                     updrect.right - updrect.left,
+                                     updrect.bottom - updrect.top,
+                                     updrect.left,
+                                     updrect.top);
+        m_CtrlQueue.ResFlush(resid, updrect.right - updrect.left, updrect.bottom - updrect.top, updrect.left, updrect.top);
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_WARNING,
+                 ("present rect (%ld,%ld)-(%ld,%ld) exceeds resource %ux%u on scan %u — skipping transfer\n",
+                  updrect.left, updrect.top, updrect.right, updrect.bottom,
+                  m_FrameBufW[scanId], m_FrameBufH[scanId], scanId));
+    }
     KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
 
     return STATUS_SUCCESS;
@@ -3102,8 +3126,14 @@ VOID VioGpuAdapter::BlackOutScreen(CURRENT_MODE *pCurrentMod)
         }
         resid = m_pFrameBuf[scanId]->GetId();
 
-        m_CtrlQueue.TransferToHost2D(resid, 0UL, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
-        m_CtrlQueue.ResFlush(resid, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
+        // Clamp to the host resource size (same anti-overrun guard as ExecutePresentDisplayOnly).
+        UINT bw = min((UINT)pCurrentMod->DispInfo.Width, (UINT)m_FrameBufW[scanId]);
+        UINT bh = min((UINT)pCurrentMod->DispInfo.Height, (UINT)m_FrameBufH[scanId]);
+        if (bw > 0 && bh > 0)
+        {
+            m_CtrlQueue.TransferToHost2D(resid, 0UL, bw, bh, 0, 0);
+            m_CtrlQueue.ResFlush(resid, bw, bh, 0, 0);
+        }
         KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     }
 
@@ -3375,22 +3405,35 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
     ULONG numScanouts = GetNumScanouts();
     BOOLEAN any = FALSE;
 
+    // One GET_DISPLAY_INFO answers for every head. If it fails (timeout, no buffer, error response), nothing is
+    // known about the heads: leave their sizes and their connection state as they are. Reading a failure as
+    // "every secondary disabled" unplugged live monitors and destroyed their scanouts, a visible flash.
+    PGPU_VBUFFER vbuf = NULL;
+    if (!m_CtrlQueue.AskDisplayInfo(&vbuf))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s: no display info, heads left unchanged\n", __FUNCTION__));
+        return FALSE;
+    }
+    if (((PGPU_RESP_DISP_INFO)vbuf->resp_buf)->hdr.type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--- %s: display info answered %x, heads left unchanged\n",
+                  __FUNCTION__,
+                  ((PGPU_RESP_DISP_INFO)vbuf->resp_buf)->hdr.type));
+        m_CtrlQueue.ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
     // Read EACH scanout's host-preferred resolution into ITS OWN custom slot.
     // Only overwrite a slot when the host actually reports a size for that
     // scanout: clobbering a head that momentarily reports "disabled" with a
     // nominal size would knock it back to 1024x768 on every config change.
     for (UINT32 i = 0; i < numScanouts; i++)
     {
-        PGPU_VBUFFER vbuf = NULL;
         ULONG xres = 0;
         ULONG yres = 0;
-        BOOLEAN ok = FALSE;
-
-        if (m_CtrlQueue.AskDisplayInfo(&vbuf))
-        {
-            ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
-            m_CtrlQueue.ReleaseBuffer(vbuf);
-        }
+        // FALSE here only means this head is disabled: the response itself was checked above.
+        BOOLEAN ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
 
 
         if (ok && xres && yres)
@@ -3440,6 +3483,8 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             // else: pre-active boot -> keep the HWInit seed (see above); the arrival comes post-start.
         }
     }
+
+    m_CtrlQueue.ReleaseBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return any;
@@ -3941,6 +3986,7 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s scan %d\n", __FUNCTION__, scanId));
     UINT resid = 0;
+    UNREFERENCED_PARAMETER(bReset);   // the scanout is now always detached before destroy (below); bReset no longer gates it
 
     // Serialise against the present/blackout readers so they never deref a deleted object or transfer to a
     // recycled id. bKeepBuffer marks the bugcheck flow (ResetToVgaMode): it can run at high IRQL and keeps the
@@ -3951,12 +3997,16 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
     if (m_pFrameBuf[scanId] != NULL)
     {
         resid = (UINT)m_pFrameBuf[scanId]->GetId();
+        // Detach the scanout from the resource BEFORE detaching its backing and destroying it. Destroying (or
+        // detaching the backing of) a resource that is STILL the active scanout is rejected by QEMU with
+        // VIRTIO_GPU_RESP_ERR_UNSPEC (resp=0x1200) whenever the host is scanning it out at that instant. Together
+        // with monotonic resource ids (viogpu_idr) this closes both halves of the resize 0x1200: monotonic ids fix
+        // the CREATE side (no id reused across heads in one commit), this fixes the DESTROY side. Unconditional: the
+        // old bReset gate skipped it on the resize path — exactly where the race fired. On resize CreateFrameBufferObj
+        // re-points the scanout at the new resource in the same synchronous burst (QEMU coalesces → no visible blank).
+        m_CtrlQueue.SetScanout(scanId, 0, 0, 0, 0, 0);
         m_CtrlQueue.DetachBacking(resid);
         m_CtrlQueue.DestroyResource(resid);
-        if (bReset == TRUE)
-        {
-            m_CtrlQueue.SetScanout(scanId, 0, 0, 0, 0, 0);
-        }
 
         if (bKeepBuffer)
         {
@@ -3968,6 +4018,8 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
             delete m_pFrameBuf[scanId];
         }
         m_pFrameBuf[scanId] = NULL;
+        m_FrameBufW[scanId] = 0;   // no resource → the present/blackout guard skips transfers on this scanout
+        m_FrameBufH[scanId] = 0;
         m_Idr.PutId(resid);
     }
     if (useLock)
@@ -4243,6 +4295,8 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.ResFlush(resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_pFrameBuf[scanId] = obj;
+    m_FrameBufW[scanId] = (USHORT)pModeInfo->VisScreenWidth;    // the host resource size — transfers clamp to this
+    m_FrameBufH[scanId] = (USHORT)pModeInfo->VisScreenHeight;
     pCurrentMode->FrameBuffer = obj->GetVirtualAddress();
     pCurrentMode->Flags.FrameBufferIsActive = TRUE;
     KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
