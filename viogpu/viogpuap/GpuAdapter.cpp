@@ -267,7 +267,10 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
     // OTHER heads' active/inactive state: e.g. head 0's instance, having queried during the transient single
     // phase, would deactivate head 1 the moment after Windows extended it → the "revert to single" on re-extend.
     // CDSEx touches only m_DeviceName's resolution and leaves the topology (which displays are active, positions)
-    // untouched. No CDS_UPDATEREGISTRY → live change only; Windows stays the owner of the persisted arrangement.
+    // untouched — so persisting it is SAFE (unlike a full-topology SetDisplayConfig+SDC_SAVE_TO_DATABASE, which
+    // restored a stale FULL snapshot and bounced sizes). CDS_UPDATEREGISTRY writes this head's mode to the CCD-backed
+    // store so that on the next topology change (dual->mono) Windows restores THIS size directly, instead of a stale
+    // nominal one it then has to be corrected from → the residual dual->mono flash self-heals.
     DEVMODE dm = {0};
     dm.dmSize = sizeof(dm);
     if (!EnumDisplaySettings(m_DeviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm))
@@ -282,7 +285,7 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
     dm.dmPelsWidth = mode->XResolution;
     dm.dmPelsHeight = mode->YResolution;
     dm.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
-    LONG r = ChangeDisplaySettingsEx(m_DeviceName.c_str(), &dm, NULL, 0, NULL);
+    LONG r = ChangeDisplaySettingsEx(m_DeviceName.c_str(), &dm, NULL, CDS_UPDATEREGISTRY, NULL);
     return (r == DISP_CHANGE_SUCCESSFUL);
 }
 
