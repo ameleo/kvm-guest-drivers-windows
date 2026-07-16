@@ -387,17 +387,21 @@ NTSTATUS VioGpuDod::QueryChildRelations(_Out_writes_bytes_(ChildRelationsSize) D
 
     for (UINT ChildIndex = 0; ChildIndex < ChildRelationsCount; ++ChildIndex)
     {
-        // Only the PRIMARY (scanout 0) is the VGA post-display output → always-connected / internal panel. The
-        // SECONDARY heads are HOTPLUGGABLE: report them Interruptible + external (HD15) so Windows HONORS their
-        // QueryChildStatus (connect/disconnect from m_bConnected). Reporting AlwaysConnected/INTERNAL for a
-        // secondary made Windows treat it as a soldered panel and IGNORE QueryChildStatus entirely — so it stayed
-        // connected regardless of GET_DISPLAY_INFO enabled=0 and a refused EDID → phantom 2nd monitor at boot.
+        // Only the PRIMARY (scanout 0) is the VGA post-display output → always-connected. The SECONDARY heads are
+        // HOTPLUGGABLE: report them Interruptible so Windows HONORS their QueryChildStatus (connect/disconnect from
+        // m_bConnected). Reporting AlwaysConnected for a secondary made Windows treat it as a soldered panel and
+        // IGNORE QueryChildStatus entirely — so it stayed connected regardless of GET_DISPLAY_INFO enabled=0 and a
+        // refused EDID → phantom 2nd monitor at boot.
         BOOLEAN primaryVga = (ChildIndex == 0) && IsVgaDevice();
         pChildRelations[ChildIndex].ChildDeviceType = TypeVideoOutput;
         pChildRelations[ChildIndex].ChildCapabilities.HpdAwareness = primaryVga ? HpdAwarenessAlwaysConnected
                                                                                 : HpdAwarenessInterruptible;
-        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = primaryVga ? D3DKMDT_VOT_INTERNAL
-                                                                                                        : D3DKMDT_VOT_HD15;
+        // EXTERNAL (HD15) for EVERY head, primary included — NEVER D3DKMDT_VOT_INTERNAL. An internal primary makes
+        // Windows model the guest as a LAPTOP (built-in panel + external monitors) and apply the Win+P projection
+        // logic → a newly-arrived head lands on "show only on" / duplicate instead of extending. All-external =
+        // a desktop multi-monitor rig → Windows auto-extends a new monitor by default. Only the interface type is
+        // uniform now; HpdAwareness still differs (primary always-connected VGA, secondaries hotpluggable).
+        pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_HD15;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
         pChildRelations[ChildIndex].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
         pChildRelations[ChildIndex].AcpiUid = 0;
