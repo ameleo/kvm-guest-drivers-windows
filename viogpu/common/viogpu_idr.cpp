@@ -56,30 +56,22 @@ BOOLEAN VioGpuIdr::Init(_In_ ULONG start)
 
 ULONG VioGpuIdr::GetId(VOID)
 {
-    ULONG id = 0;
-
-    FreeId *freeId = reinterpret_cast<FreeId *>(ExInterlockedRemoveHeadList(&m_freeList, &m_lock));
-    if (freeId != NULL)
-    {
-        id = freeId->id;
-        delete freeId;
-    }
-    else
-    {
-        id = m_nextId++;
-    }
-
+    // Allocate resource ids MONOTONICALLY and never reuse them. Reusing a just-freed id made QEMU reject the
+    // recycled resource: on a dual VidPN commit head 0 destroys resource N and head 1 immediately re-creates
+    // resource N (same id off the free list). QEMU cannot cleanly destroy-then-recreate the same id back-to-back,
+    // so it kept the old (wrong-sized) resource, and every SET_SCANOUT / TRANSFER_TO_HOST_2D to it failed with
+    // VIRTIO_GPU_RESP_ERR_UNSPEC (0x1200) — the "occasional 0x1200 on every resolution". A fresh id per resource
+    // sidesteps it entirely; 32-bit ids do not exhaust within a driver session (they reset on driver reload).
+    ULONG id = (ULONG)InterlockedExchangeAdd((volatile LONG *)&m_nextId, 1);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d\n", __FUNCTION__, id));
-
     return id;
 }
 
 VOID VioGpuIdr::PutId(_In_ ULONG id)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d\n", __FUNCTION__, id));
-    FreeId *freeId = new (NonPagedPoolNx) FreeId;
-    freeId->id = id;
-    ExInterlockedInsertTailList(&m_freeList, &freeId->list_entry, &m_lock);
+    // No-op: ids are never recycled (see GetId) — recycling caused the destroy-recreate-same-id 0x1200 hazard.
+    UNREFERENCED_PARAMETER(id);
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d (not recycled)\n", __FUNCTION__, id));
 }
 
 VOID VioGpuIdr::Close(VOID)
