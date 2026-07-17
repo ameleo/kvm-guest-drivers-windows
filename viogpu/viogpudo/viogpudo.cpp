@@ -3474,6 +3474,40 @@ void VioGpuAdapter::FixEdid(void)
     pdata->Checksum[0] = -Sum;
 }
 
+// Zero the EDID physical-size fields so Windows has NO basis to recommend a >100% DPI scale. A DaaS desktop is
+// rendered 1:1 to the client; letting Windows scale the guest only wastes resolution and produced a surprise zoom
+// once the primary became an external output (an internal panel had a fixed DPI; an external one derives DPI from
+// the EDID physical size). Windows reads the size from TWO places — block-0 bytes 21/22 (max image size, cm) AND
+// each detailed-timing descriptor's mm image size — so both are cleared, then the block-0 checksum is recomputed.
+static void NeutralizeEdidPhysicalSize(BYTE *edid)
+{
+    if (edid == NULL)
+    {
+        return;
+    }
+    edid[21] = 0;   // max horizontal image size (cm)
+    edid[22] = 0;   // max vertical image size (cm)
+    // Four 18-byte descriptors at 54/72/90/108. A detailed-timing descriptor has a non-zero pixel clock (bytes
+    // 0..1); its image size is byte 12 (h mm low), 13 (v mm low), 14 (high nibbles). Display descriptors (pixel
+    // clock 0 = monitor name / range limits) are left untouched.
+    for (int d = 54; d <= 108; d += 18)
+    {
+        if (edid[d] != 0 || edid[d + 1] != 0)
+        {
+            edid[d + 12] = 0;
+            edid[d + 13] = 0;
+            edid[d + 14] = 0;
+        }
+    }
+    // Block-0 checksum: the 128 bytes must sum to 0 (mod 256).
+    BYTE sum = 0;
+    for (int i = 0; i < EDID_RAW_BLOCK_SIZE - 1; ++i)
+    {
+        sum = (BYTE)(sum + edid[i]);
+    }
+    edid[EDID_RAW_BLOCK_SIZE - 1] = (BYTE)(0x100 - sum);
+}
+
 BOOLEAN VioGpuAdapter::GetEdids(void)
 {
     PAGED_CODE();
@@ -3537,6 +3571,16 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
         }
     }
 
+    // Force 100% scaling: strip the physical size from every head's EDID (recomputes the checksum, so it runs
+    // AFTER the distinct-identity nudge above). Windows then has no basis for a >96 DPI recommendation.
+    for (UINT32 i = 0; i < numScanouts; i++)
+    {
+        if (m_bEDID[i])
+        {
+            NeutralizeEdidPhysicalSize(m_EDIDs[i]);
+        }
+    }
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
 }
@@ -3578,6 +3622,7 @@ BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
             m_EDIDs[scanId][12] = (BYTE)(m_EDIDs[scanId][12] + scanId);       // serial byte
             m_EDIDs[scanId][127] = (BYTE)(m_EDIDs[scanId][127] - 2 * scanId); // keep block-0 checksum == 0
         }
+        NeutralizeEdidPhysicalSize(m_EDIDs[scanId]);   // force 100% scaling (recomputes checksum, so run last)
         m_bEDID[scanId] = TRUE;
         got = TRUE;
     }
