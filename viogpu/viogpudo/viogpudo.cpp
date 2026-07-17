@@ -3984,6 +3984,7 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s scan %d\n", __FUNCTION__, scanId));
     UINT resid = 0;
+    UNREFERENCED_PARAMETER(bReset);   // the scanout is now always detached before destroy (below); bReset no longer gates it
 
     // Serialise against the present/blackout readers so they never deref a deleted object or transfer to a
     // recycled id. bKeepBuffer marks the bugcheck flow (ResetToVgaMode): it can run at high IRQL and keeps the
@@ -3994,12 +3995,16 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
     if (m_pFrameBuf[scanId] != NULL)
     {
         resid = (UINT)m_pFrameBuf[scanId]->GetId();
+        // Detach the scanout from the resource BEFORE detaching its backing and destroying it. Destroying (or
+        // detaching the backing of) a resource that is STILL the active scanout is rejected by QEMU with
+        // VIRTIO_GPU_RESP_ERR_UNSPEC (resp=0x1200) whenever the host is scanning it out at that instant. Together
+        // with monotonic resource ids (viogpu_idr) this closes both halves of the resize 0x1200: monotonic ids fix
+        // the CREATE side (no id reused across heads in one commit), this fixes the DESTROY side. Unconditional: the
+        // old bReset gate skipped it on the resize path — exactly where the race fired. On resize CreateFrameBufferObj
+        // re-points the scanout at the new resource in the same synchronous burst (QEMU coalesces → no visible blank).
+        m_CtrlQueue.SetScanout(scanId, 0, 0, 0, 0, 0);
         m_CtrlQueue.DetachBacking(resid);
         m_CtrlQueue.DestroyResource(resid);
-        if (bReset == TRUE)
-        {
-            m_CtrlQueue.SetScanout(scanId, 0, 0, 0, 0, 0);
-        }
 
         if (bKeepBuffer)
         {
