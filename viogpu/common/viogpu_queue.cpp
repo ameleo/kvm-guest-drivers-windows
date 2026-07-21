@@ -44,9 +44,76 @@ static BOOLEAN BuildSGElement(VirtIOBufferDescriptor *sg, PVOID buf, ULONG size)
     return FALSE;
 }
 
-static void NotifyEventCompleteCB(void *ctx)
+// Heap-allocated, refcounted context for the synchronous command waiters (AskDisplayInfo / AskEdidInfo /
+// TransferToHost2D(wait)). The old pattern (on-stack KEVENT + bounded wait) corrupted the dead stack frame
+// whenever the completion fired AFTER a timeout: the DPC KeSetEvent'd an address inside a returned function's
+// stack — delayed random corruption/crash. Refs start at 2 (waiter + completion); whoever drops the last
+// reference frees the context, and if the waiter had timed out, also releases the still-in-flight buffer.
+typedef struct _GPU_WAIT_CTX
 {
-    KeSetEvent((PKEVENT)ctx, IO_NO_INCREMENT, FALSE);
+    KEVENT Event;
+    volatile LONG Refs;
+    BOOLEAN TimedOut; // set by the waiter BEFORE dropping its ref (published by the interlocked op)
+    PGPU_VBUFFER pBuf;
+    VioGpuQueue *pQueue;
+} GPU_WAIT_CTX, *PGPU_WAIT_CTX;
+
+static void WaitCtxCompleteCB(void *ctx)
+{
+    PGPU_WAIT_CTX pCtx = (PGPU_WAIT_CTX)ctx;
+    KeSetEvent(&pCtx->Event, IO_NO_INCREMENT, FALSE);
+    if (InterlockedDecrement(&pCtx->Refs) == 0)
+    {
+        // The waiter timed out and is long gone; the command is done NOW — release the buffer here so a
+        // post-timeout completion neither leaks it nor touches freed memory.
+        if (pCtx->TimedOut)
+        {
+            pCtx->pQueue->ReleaseBuffer(pCtx->pBuf);
+        }
+        delete[] reinterpret_cast<PBYTE>(pCtx);
+    }
+}
+
+PGPU_WAIT_CTX VioGpuQueue::PrepareWait(PGPU_VBUFFER pBuf)
+{
+    PGPU_WAIT_CTX pCtx = reinterpret_cast<PGPU_WAIT_CTX>(new (NonPagedPoolNx) BYTE[sizeof(GPU_WAIT_CTX)]);
+    if (!pCtx)
+    {
+        return NULL;
+    }
+    KeInitializeEvent(&pCtx->Event, NotificationEvent, FALSE);
+    pCtx->Refs = 2;
+    pCtx->TimedOut = FALSE;
+    pCtx->pBuf = pBuf;
+    pCtx->pQueue = this;
+    pBuf->complete_cb = WaitCtxCompleteCB;
+    pBuf->complete_ctx = pCtx;
+    pBuf->auto_release = false;
+    return pCtx;
+}
+
+BOOLEAN VioGpuQueue::WaitForCompletion(PGPU_WAIT_CTX pCtx, ULONG TimeoutMs)
+{
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = Int32x32To64(TimeoutMs, -10000);
+    NTSTATUS status = KeWaitForSingleObject(&pCtx->Event, Executive, KernelMode, FALSE, &timeout);
+    if (status != STATUS_TIMEOUT)
+    {
+        if (InterlockedDecrement(&pCtx->Refs) == 0)
+        {
+            delete[] reinterpret_cast<PBYTE>(pCtx);
+        }
+        return TRUE; // completed: the caller owns pBuf (reads the response, then ReleaseBuffer)
+    }
+    pCtx->TimedOut = TRUE;
+    if (InterlockedDecrement(&pCtx->Refs) == 0)
+    {
+        // The completion fired between the wait timing out and this decrement. The command actually completed,
+        // but the caller is being told FALSE — release the buffer ourselves so nothing leaks.
+        ReleaseBuffer(pCtx->pBuf);
+        delete[] reinterpret_cast<PBYTE>(pCtx);
+    }
+    return FALSE; // caller must NOT touch pBuf — its release belongs to the completion (or happened above)
 }
 
 VioGpuQueue::VioGpuQueue()
@@ -204,8 +271,6 @@ BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
     PGPU_CTRL_HDR cmd;
     PGPU_VBUFFER vbuf;
     PGPU_RESP_DISP_INFO resp_buf;
-    KEVENT event;
-    NTSTATUS status;
 
     resp_buf = reinterpret_cast<PGPU_RESP_DISP_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_DISP_INFO)]);
 
@@ -220,21 +285,18 @@ BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
 
     cmd->type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
 
-    KeInitializeEvent(&event, NotificationEvent, FALSE);
-    vbuf->complete_cb = NotifyEventCompleteCB;
-    vbuf->complete_ctx = &event;
-    vbuf->auto_release = false;
-
-    LARGE_INTEGER timeout = {0};
-    timeout.QuadPart = Int32x32To64(1000, -10000);
-
-    QueueBuffer(vbuf);
-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
-
-    if (status == STATUS_TIMEOUT)
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
     {
+        ReleaseBuffer(vbuf); // frees resp_buf too (resp_size > MAX_INLINE_RESP_SIZE)
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        // Survivable: the caller just skips this scanout's info. The buffer is released by the wait machinery.
         DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to ask display info\n"));
-        VioGpuDbgBreak();
+        return FALSE;
     }
     *buf = vbuf;
 
@@ -252,8 +314,6 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
     PGPU_CMD_GET_EDID cmd;
     PGPU_VBUFFER vbuf;
     PGPU_RESP_EDID resp_buf;
-    KEVENT event;
-    NTSTATUS status;
 
     resp_buf = reinterpret_cast<PGPU_RESP_EDID>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_EDID)]);
 
@@ -268,22 +328,18 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
     cmd->hdr.type = VIRTIO_GPU_CMD_GET_EDID;
     cmd->scanout = id;
 
-    KeInitializeEvent(&event, NotificationEvent, FALSE);
-    vbuf->complete_cb = NotifyEventCompleteCB;
-    vbuf->complete_ctx = &event;
-    vbuf->auto_release = false;
-
-    LARGE_INTEGER timeout = {0};
-    timeout.QuadPart = Int32x32To64(1000, -10000);
-
-    QueueBuffer(vbuf);
-
-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
-
-    if (status == STATUS_TIMEOUT)
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
     {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        // Survivable: the caller falls back to the boot/default EDID. The buffer is released by the wait machinery.
         DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to get edid info\n"));
-        VioGpuDbgBreak();
+        return FALSE;
     }
 
     *buf = vbuf;
@@ -393,31 +449,26 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
         // UPDATE_CURSOR before this transfer completes and display a stale
         // cursor image (issue #977). Completing the transfer on the control
         // queue guarantees the resource is up to date when UPDATE_CURSOR runs.
-        KEVENT event;
-        NTSTATUS status;
-        KeInitializeEvent(&event, NotificationEvent, FALSE);
-        vbuf->complete_cb = NotifyEventCompleteCB;
-        vbuf->complete_ctx = &event;
-        vbuf->auto_release = false;
-
-        // Bounded wait with a 100 ms safety net. An INFINITE wait was tried (to close a latent UAF: a late
-        // completion after a timeout would KeSetEvent the on-stack event) but it HANGS boot on this path --
-        // the cursor transfer rides the ctrl queue during multi-head bring-up and a stall left SetPointerShape
-        // blocked forever, so the second head's VidPN commit never ran (primary up, secondary lost). Restore
-        // the timeout that shipped known-good; on timeout, LEAK the buffer rather than free one the device may
-        // still own. (Proper fix: a heap-allocated event the completion frees -> safe AND cannot hang. TODO.)
-        LARGE_INTEGER timeout = {0};
-        timeout.QuadPart = Int32x32To64(100, -10000); // 100 ms safety net
-
-        QueueBuffer(vbuf);
-        status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
-        if (status == STATUS_TIMEOUT)
+        // Bounded 100 ms wait through the heap wait-context: cannot hang boot (the INFINITE-wait attempt did,
+        // through a stalled ctrl queue during multi-head bring-up), and a completion firing AFTER the timeout
+        // lands on valid heap memory and releases the buffer itself — the historic on-stack KEVENT corrupted a
+        // dead stack frame there, and the deliberate leak is gone too.
+        PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+        if (!ctx)
         {
-            DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s transfer wait timed out\n", __FUNCTION__));
+            QueueBuffer(vbuf); // no context memory: degrade to fire-and-forget (auto_release frees it)
         }
         else
         {
-            ReleaseBuffer(vbuf);
+            QueueBuffer(vbuf);
+            if (WaitForCompletion(ctx, 100))
+            {
+                ReleaseBuffer(vbuf);
+            }
+            else
+            {
+                DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s transfer wait timed out\n", __FUNCTION__));
+            }
         }
     }
     else
