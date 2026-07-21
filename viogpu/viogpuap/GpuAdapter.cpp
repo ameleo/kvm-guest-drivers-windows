@@ -320,6 +320,12 @@ void GpuAdapter::SyncResolution(void)
         }
     }
 
+    // Wake a STATIC head after a no-op sync: when a client (re)connects asking for the size a head already has,
+    // nothing above changes anything, so nothing wakes DWM — a never-painted head stays black until the first
+    // user-generated damage (a click). Invalidating every window forces a full repaint -> DWM presents -> the
+    // driver flips -> the host stream gets a real frame. Cheap, and a genuine resize repaints anyway.
+    InvalidateRect(NULL, NULL, TRUE);
+
     if (hLock)
     {
         ReleaseMutex(hLock);
