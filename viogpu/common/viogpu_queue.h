@@ -156,6 +156,10 @@ class VioGpuObj
     VioGpuMemSegment *m_pSegment;
 };
 
+// Heap-allocated synchronous-wait context (defined in viogpu_queue.cpp): survives the waiter's stack frame, so a
+// completion firing AFTER a timeout signals valid memory instead of corrupting a dead stack.
+typedef struct _GPU_WAIT_CTX GPU_WAIT_CTX, *PGPU_WAIT_CTX;
+
 class VioGpuQueue
 {
   public:
@@ -206,6 +210,10 @@ class VioGpuQueue
         m_pBuf = pbuf;
     }
     void ReleaseBuffer(PGPU_VBUFFER buf);
+    // Synchronous-wait helpers (see GPU_WAIT_CTX): PrepareWait BEFORE QueueBuffer; WaitForCompletion returns FALSE
+    // on timeout, in which case the buffer belongs to the machinery (the caller must NOT touch or release it).
+    PGPU_WAIT_CTX PrepareWait(PGPU_VBUFFER pBuf);
+    BOOLEAN WaitForCompletion(PGPU_WAIT_CTX pCtx, ULONG TimeoutMs);
 
   protected:
     _IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql,
