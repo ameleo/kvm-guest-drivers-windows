@@ -2984,7 +2984,10 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
         fb_size = max(req_size, fb_size);
     }
 
-    if (!m_FrameSegment[0].Init(fb_size, &fb_pa))
+    // Blob path: allocate the framebuffer WRITE-COMBINED (real-hardware semantics; the BAR path is WC already).
+    // The CPU only ever writes it, and with KVM honoring the guest PAT the host-side udmabuf pages are WC too —
+    // the i915 dmabuf import then has no CPU cache to flush (no more host wbinvd storms per frame).
+    if (!m_FrameSegment[0].Init(fb_size, &fb_pa, m_bBlobSupported))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("%s failed to allocate FB memory segment\n", __FUNCTION__));
         status = STATUS_INSUFFICIENT_RESOURCES;
@@ -3012,7 +3015,7 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     for (UINT scan = 1; scan < numScanouts; scan++)
     {
         PHYSICAL_ADDRESS sys_pa = {0};
-        if (!m_FrameSegment[scan].Init(req_size, &sys_pa))
+        if (!m_FrameSegment[scan].Init(req_size, &sys_pa, m_bBlobSupported))
         {
             DbgPrint(TRACE_LEVEL_FATAL,
                      ("%s failed to allocate FB memory segment for scanout %u\n", __FUNCTION__, scan));
