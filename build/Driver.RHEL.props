@@ -10,7 +10,7 @@ RHEL inf substitutions and versioning used by all drivers.
     <!-- Second component of driver version -->
     <_RHEL_RELEASE_VERSION_ Condition="'$(_RHEL_RELEASE_VERSION_)' == ''">200</_RHEL_RELEASE_VERSION_>
     <!-- Third component of driver version (local build counter — bump each deploy) -->
-    <_BUILD_MAJOR_VERSION_ Condition="'$(_BUILD_MAJOR_VERSION_)' == ''">210</_BUILD_MAJOR_VERSION_>
+    <_BUILD_MAJOR_VERSION_ Condition="'$(_BUILD_MAJOR_VERSION_)' == ''">213</_BUILD_MAJOR_VERSION_>
     <!-- Fourth component of driver version -->
     <_BUILD_MINOR_VERSION_ Condition="'$(_BUILD_MINOR_VERSION_)' == ''">0</_BUILD_MINOR_VERSION_>
   </PropertyGroup>

@@ -32,6 +32,11 @@
 #include "viogpu.h"
 #include "viogpu_queue.h"
 
+// FALLBACK simulated-vblank rate (Hz), used when the host EDID has no usable detailed timing. The actual rate
+// comes from the host EDID (VioGpuAdapter::GetEdidRefreshHz) so the host controls it, like for a Linux guest.
+// The timer and the reported VSyncFreq always use the SAME rate (KMDOD consistency requirement).
+#define VIOGPU_VSYNC_RATE 60
+
 #pragma pack(push)
 #pragma pack(1)
 
@@ -160,6 +165,7 @@ class VioGpuAdapter : IVioGpuPCI
         return m_Id;
     }
     PBYTE GetEdidData(UINT scanId = 0);
+    UINT GetEdidRefreshHz(void);   // global refresh from the host EDID's first DTD (scanout 0; fallback 60)
     PBYTE GetCTA861Data(void);
     BOOLEAN IsChildConnected(UINT childUid)
     {
@@ -269,6 +275,13 @@ class VioGpuDod
 
     USHORT m_PersistentDispMode0Width;
     USHORT m_PersistentDispMode0Height;
+
+    // VSync control (the documented KMDOD contract): once the signal info reports a REAL refresh rate, dxgkrnl
+    // requires the vsync-interrupt machinery. A virtio-gpu has no scanout vblank, so a 60 Hz KTIMER simulates it:
+    // DPC -> DxgkCbSynchronizeExecution -> DxgkCbNotifyInterrupt(DISPLAYONLY_VSYNC) + DxgkCbQueueDpc (QXL's model).
+    KTIMER m_VsyncTimer;
+    KDPC m_VsyncTimerDpc;
+    BOOLEAN m_bVsyncEnabled;
 
   public:
     VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject);
@@ -395,6 +408,13 @@ class VioGpuDod
                             _In_ INT PositionX,
                             _In_ INT PositionY);
     NTSTATUS SetRegisterConfigInfo(void);
+
+    // VSync control (see the member block): enable/disable the 60 Hz simulated-vblank timer.
+    VOID EnableVsync(BOOLEAN bEnable);
+    VOID IndicateVSyncInterrupt(void);
+    VOID VsyncTimerProc(void);
+    static BOOLEAN VsyncTimerSynchRoutine(PVOID context);
+    static VOID VsyncTimerProcGate(_In_ _KDPC *dpc, _In_ PVOID context, _In_ PVOID arg1, _In_ PVOID arg2);
 
     PDXGKRNL_INTERFACE GetDxgkInterface(void)
     {

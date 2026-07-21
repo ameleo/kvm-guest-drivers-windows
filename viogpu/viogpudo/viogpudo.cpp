@@ -57,6 +57,9 @@ VioGpuDod::VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     RtlZeroMemory(&m_PointerShape, sizeof(m_PointerShape));
     m_PersistentDispMode0Width = 0;
     m_PersistentDispMode0Height = 0;
+    KeInitializeDpc(&m_VsyncTimerDpc, VsyncTimerProcGate, this);
+    KeInitializeTimer(&m_VsyncTimer);
+    m_bVsyncEnabled = FALSE;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
@@ -255,6 +258,7 @@ NTSTATUS VioGpuDod::StopDevice(VOID)
 {
     PAGED_CODE();
 
+    EnableVsync(FALSE);   // stop the simulated-vblank timer before the device goes away
     m_Flags.DriverStarted = FALSE;
     return STATUS_SUCCESS;
 }
@@ -519,6 +523,10 @@ NTSTATUS VioGpuDod::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQuery
                 }
                 pDriverCaps->SupportNonVGA = IsVgaDevice();
                 pDriverCaps->SupportSmoothRotation = TRUE;
+                // VSync control implemented (simulated vblank) -> advertise the power-save awareness so the OS
+                // enables/disables the vsync interrupt through DxgkDdiControlInterrupt instead of assuming a
+                // free-running one.
+                pDriverCaps->SchedulingCaps.VSyncPowerSaveAware = 1;
                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s 1\n", __FUNCTION__));
                 return STATUS_SUCCESS;
             }
@@ -923,6 +931,29 @@ NTSTATUS VioGpuDod::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INTER
     return STATUS_SUCCESS;
 }
 
+// Start/stop the simulated-vblank timer. Driven by dxgkrnl through DxgkDdiControlInterrupt
+// (DXGK_INTERRUPT_DISPLAYONLY_VSYNC) — the OS enables it when something waits on vblank, disables it when idle
+// (that is the "Saving Energy with VSync Control" contract). Rate must match the VSyncFreq reported in the
+// video signal info.
+VOID VioGpuDod::EnableVsync(BOOLEAN bEnable)
+{
+    PAGED_CODE();
+    m_bVsyncEnabled = bEnable;
+    if (!bEnable)
+    {
+        KeCancelTimer(&m_VsyncTimer);
+        DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: vsync timer stopped\n", __FUNCTION__));
+    }
+    else
+    {
+        const UINT rate = m_pHWDevice ? m_pHWDevice->GetEdidRefreshHz() : VIOGPU_VSYNC_RATE;
+        LARGE_INTEGER due;
+        due.QuadPart = -10000000LL / rate;
+        KeSetTimerEx(&m_VsyncTimer, due, 1000 / rate, &m_VsyncTimerDpc);
+        DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: vsync timer started (%u Hz)\n", __FUNCTION__, rate));
+    }
+}
+
 VOID VioGpuDod::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo)
 {
     PAGED_CODE();
@@ -934,17 +965,18 @@ VOID VioGpuDod::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo
     // filled, so the panel showed an active signal of "-1 x -1".
     pVideoSignalInfo->ActiveSize = pVideoSignalInfo->TotalSize;
 
-    // The frequencies MUST stay NOTSPECIFIED. Proven by isolation (v209): reporting a concrete rate — even a clean
-    // hardcoded 60/1 with matching HSync/PixelRate — breaks the display on Win11. A concrete refresh makes dxgkrnl
-    // engage vsync scheduling, which a DOD without the vsync-interrupt machinery (DxgkDdiControlInterrupt +
-    // DxgkDdiGetScanLine + a timer raising CRTC_VSYNC) cannot honor; qxl-wddm-dod documents the same trap (watchdog,
-    // Code 43) and ships its complete implementation DISABLED by default. NOTSPECIFIED acts as a wildcard and is the
-    // safe contract for a DOD.
-    pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    // Concrete frequencies are part of the VSync-control contract, ALL-OR-NOTHING (documented KMDOD rule, and
+    // proven by isolation: v209 reported 60 Hz without the machinery -> dxgkrnl refused the driver). This driver
+    // implements the full package: DxgkDdiControlInterrupt drives EnableVsync (a timer simulating vblank via
+    // DxgkCbNotifyInterrupt(DISPLAYONLY_VSYNC)), so the signal info MUST report the matching real rate. The rate
+    // comes from the host EDID (GetEdidRefreshHz) — the host keeps control of it, exactly like the Linux guest —
+    // and the timer runs at the SAME rate (consistency requirement).
+    const UINT refreshHz = m_pHWDevice ? m_pHWDevice->GetEdidRefreshHz() : VIOGPU_VSYNC_RATE;
+    pVideoSignalInfo->VSyncFreq.Numerator = refreshHz;
+    pVideoSignalInfo->VSyncFreq.Denominator = 1;
+    pVideoSignalInfo->HSyncFreq.Numerator = refreshHz * pModeInfo->VisScreenHeight; // lines per second
+    pVideoSignalInfo->HSyncFreq.Denominator = 1;
+    pVideoSignalInfo->PixelRate = (SIZE_T)pModeInfo->VisScreenWidth * pModeInfo->VisScreenHeight * refreshHz;
     pVideoSignalInfo->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
 }
 
@@ -2111,6 +2143,62 @@ VOID VioGpuDod::SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride) 
     }
 }
 
+// ── VSync control: simulated vblank ─────────────────────────────────────────────────────────────
+// virtio-gpu has no scanout vblank interrupt, so a periodic timer simulates one (QXL's model). All three
+// routines run at elevated IRQL (timer DPC / device IRQL) — non-paged.
+
+VOID VioGpuDod::IndicateVSyncInterrupt(void)
+{
+    // Notify the vsync for EVERY connected target, not just target 0: dxgkrnl arms a PER-TARGET vsync watchdog,
+    // and a multi-head topology whose secondary target never receives its vblank gets the device STOPPED (WER
+    // "WATCHDOG" live dump -> StopDeviceAndReleasePostDisplayOwnership -> black screen, basic-display fallback).
+    // QXL never hit this because it is single-head in practice.
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA data;
+    const ULONG numScanouts = m_pHWDevice ? m_pHWDevice->GetNumScanouts() : 1;
+    for (ULONG i = 0; i < numScanouts; i++)
+    {
+        if (i != 0 && !(m_pHWDevice && m_pHWDevice->IsChildConnected(i)))
+        {
+            continue;
+        }
+        RtlZeroMemory(&data, sizeof(data));
+        data.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
+        data.DisplayOnlyVsync.VidPnTargetId = i;
+        m_DxgkInterface.DxgkCbNotifyInterrupt(m_DxgkInterface.DeviceHandle, &data);
+    }
+    m_DxgkInterface.DxgkCbQueueDpc(m_DxgkInterface.DeviceHandle);
+}
+
+BOOLEAN VioGpuDod::VsyncTimerSynchRoutine(PVOID context)
+{
+    // Runs at device IRQL under DxgkCbSynchronizeExecution — the only legal context for DxgkCbNotifyInterrupt.
+    VioGpuDod *pDod = reinterpret_cast<VioGpuDod *>(context);
+    pDod->IndicateVSyncInterrupt();
+    return TRUE;
+}
+
+VOID VioGpuDod::VsyncTimerProc(void)
+{
+    BOOLEAN bDummy = FALSE;
+    if (m_bVsyncEnabled && m_AdapterPowerState == PowerDeviceD0)
+    {
+        m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle,
+                                                   VsyncTimerSynchRoutine,
+                                                   this,
+                                                   0,
+                                                   &bDummy);
+    }
+}
+
+VOID VioGpuDod::VsyncTimerProcGate(_In_ _KDPC *dpc, _In_ PVOID context, _In_ PVOID arg1, _In_ PVOID arg2)
+{
+    UNREFERENCED_PARAMETER(dpc);
+    UNREFERENCED_PARAMETER(arg1);
+    UNREFERENCED_PARAMETER(arg2);
+    VioGpuDod *pDod = reinterpret_cast<VioGpuDod *>(context);
+    pDod->VsyncTimerProc();
+}
+
 #pragma code_seg(pop) // End Non-Paged Code
 
 PAGED_CODE_SEG_BEGIN
@@ -2638,6 +2726,37 @@ PBYTE VioGpuAdapter::GetEdidData(UINT scanId)
         scanId = 0;
     }
     return m_bEDID[scanId] ? m_EDIDs[scanId] : (PBYTE)(g_gpu_edid);
+}
+
+// Refresh rate derived from the FIRST detailed timing descriptor of the host EDID: the host authors the EDID
+// (QEMU), so it keeps control of the guest's refresh — the same contract as the Linux guest, where changing the
+// host EDID timing changes the guest rate. One GLOBAL rate (scanout 0): the simulated-vblank timer is global, and
+// the signal-info frequencies must match the actual interrupt cadence. Falls back to VIOGPU_VSYNC_RATE when the
+// DTD is absent or implausible.
+UINT VioGpuAdapter::GetEdidRefreshHz(void)
+{
+    PAGED_CODE();
+
+    PBYTE edid = GetEdidData(0);
+    if (edid)
+    {
+        // DTD layout: pixel clock in 10 kHz units (LE u16 at 54); h/v active and blanking split over 56-61.
+        ULONG pclk10k = (ULONG)edid[54] | ((ULONG)edid[55] << 8);
+        ULONG htotal = ((ULONG)edid[56] | (((ULONG)edid[58] & 0xF0) << 4)) +
+                       ((ULONG)edid[57] | (((ULONG)edid[58] & 0x0F) << 8));
+        ULONG vtotal = ((ULONG)edid[59] | (((ULONG)edid[61] & 0xF0) << 4)) +
+                       ((ULONG)edid[60] | (((ULONG)edid[61] & 0x0F) << 8));
+        if (pclk10k != 0 && htotal != 0 && vtotal != 0)
+        {
+            ULONGLONG total = (ULONGLONG)htotal * vtotal;
+            ULONGLONG hz = ((ULONGLONG)pclk10k * 10000ULL + total / 2) / total;
+            if (hz >= 24 && hz <= 240)
+            {
+                return (UINT)hz;
+            }
+        }
+    }
+    return VIOGPU_VSYNC_RATE;
 }
 
 PBYTE VioGpuAdapter::GetCTA861Data(void)
