@@ -182,6 +182,7 @@ class VioGpuAdapter : IVioGpuPCI
     NTSTATUS UpdateChildStatus(UINT childUid, BOOLEAN connect);
     void SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ USHORT yres);
     BOOLEAN CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode, UINT scanId);
+    BOOLEAN CreateBlobResource(UINT resid, PSCATTER_GATHER_LIST sgl, UINT nents, ULONGLONG size);
     void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId);
     BOOLEAN CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     BOOLEAN UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
@@ -210,6 +211,7 @@ class VioGpuAdapter : IVioGpuPCI
     CPciResources m_PciResources;
     UINT64 m_u64HostFeatures;
     UINT64 m_u64GuestFeatures;
+    BOOLEAN m_bBlobSupported;   // VIRTIO_GPU_F_RESOURCE_BLOB negotiated -> blob scanout path (else classic 2D)
     UINT32 m_u32NumCapsets;
     UINT32 m_u32NumScanouts;
     CtrlQueue m_CtrlQueue;
@@ -219,6 +221,10 @@ class VioGpuAdapter : IVioGpuPCI
     VioGpuObj *m_pFrameBuf[MAX_SCANOUTS];
     USHORT m_FrameBufW[MAX_SCANOUTS];   // host resource dimensions per scanout — the Present/BlackOut transfer is
     USHORT m_FrameBufH[MAX_SCANOUTS];   // clamped to these so a stale mode can never overrun the resource (UNSPEC)
+    // The stride and format the scanout's blob resources were created with. A flip must describe the resource
+    // as it is, not the current mode, which can already be ahead of it (0x1205, or a sheared image).
+    ULONG m_FrameBufStride[MAX_SCANOUTS];
+    UINT m_FrameBufFormat[MAX_SCANOUTS];
     // Serialises each scanout's framebuffer object between the present/blackout readers (which deref
     // m_pFrameBuf[scanId]->GetId() and issue the host transfer) and the hotplug/mode/power writers (which
     // delete the object and recycle its resource id). Per-scanout so heads never block each other. Guarded (not
@@ -242,6 +248,8 @@ class VioGpuAdapter : IVioGpuPCI
     UINT m_CursorHotY;
     VioGpuMemSegment m_CursorSegment;
     VioGpuMemSegment m_FrameSegment[MAX_SCANOUTS];
+    UINT m_BlobResidB[MAX_SCANOUTS];   // second blob resource id (double-buffer: ping-pong the scanout A<->B)
+    UINT m_BlobFlip[MAX_SCANOUTS];     // which blob resource is currently scanned out (0=A in m_pFrameBuf, 1=B)
     volatile ULONG m_PendingWorks;
     KEVENT m_ConfigUpdateEvent;
     PETHREAD m_pWorkThread;

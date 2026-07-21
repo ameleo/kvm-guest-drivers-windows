@@ -500,6 +500,63 @@ void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
 
 PAGED_CODE_SEG_END
 
+// NONPAGED like SetScanout/DetachBacking/DestroyResource: both blob functions run in DestroyFrameBufferObj, which
+// the bugcheck flow (ResetToVgaMode) may enter at elevated IRQL — paged code there would double-fault.
+
+// Create a blob resource. The guest pages (ents) ride as command data, like ATTACH_BACKING, and the queue
+// completion frees them (FreeBuf) — the caller must NOT free ents.
+void CtrlQueue::CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_CREATE_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_CREATE_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cmd->resource_id = res_id;
+    cmd->blob_mem = blob_mem;
+    cmd->blob_flags = blob_flags;
+    cmd->nr_entries = nents;
+    cmd->blob_id = 0;   // MEM_GUEST: no host-side blob id
+    cmd->size = size;
+
+    vbuf->data_buf = ents;
+    vbuf->data_size = sizeof(*ents) * nents;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_SET_SCANOUT_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_SET_SCANOUT_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+    cmd->scanout_id = scan_id;
+    cmd->resource_id = res_id;
+    cmd->format = format;
+    cmd->width = width;
+    cmd->height = height;
+    cmd->r.x = 0;
+    cmd->r.y = 0;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->strides[0] = stride;
+    cmd->offsets[0] = 0;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
 void CtrlQueue::DestroyResource(UINT res_id)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
@@ -939,6 +996,7 @@ VioGpuMemSegment::VioGpuMemSegment(void)
     m_pMdl = NULL;
     m_bSystemMemory = FALSE;
     m_bMapped = FALSE;
+    m_bWCAlloc = FALSE;
     m_Size = 0;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
@@ -954,7 +1012,7 @@ VioGpuMemSegment::~VioGpuMemSegment(void)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr)
+BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr, _In_ BOOLEAN bWriteCombined)
 {
     PAGED_CODE();
 
@@ -968,15 +1026,57 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
 
     if ((pPAddr == NULL) || pPAddr->QuadPart == 0LL)
     {
-        m_pVAddr = new (NonPagedPoolNx) BYTE[size];
-
-        if (!m_pVAddr)
+        if (bWriteCombined)
         {
-            DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate %x bytes\n", __FUNCTION__, size));
-            return FALSE;
+            // Real-hardware framebuffer semantics: locked MDL pages mapped WRITE-COMBINED (the PCI-BAR path
+            // below maps WC too, via MapFrameBuffer). The present path only ever WRITES the framebuffer
+            // (row-sequential blits — ideal for WC streaming stores); nothing in the driver reads it back.
+            // Allocating through MmAllocatePagesForMdlEx also guarantees no aliasing cached mapping exists.
+            PHYSICAL_ADDRESS low = {0}, high = {0}, skip = {0};
+            high.QuadPart = -1LL;
+            // PREFER_CONTIGUOUS: long physical runs keep a blob's mem-entry list short (QEMU refuses more than
+            // 16384 entries). Only a preference, so a fragmented guest still gets its pages.
+            m_pMdl = MmAllocatePagesForMdlEx(low,
+                                             high,
+                                             skip,
+                                             size,
+                                             MmWriteCombined,
+                                             MM_ALLOCATE_FULLY_REQUIRED | MM_ALLOCATE_PREFER_CONTIGUOUS);
+            if (!m_pMdl)
+            {
+                DbgPrint(TRACE_LEVEL_FATAL, ("%s failed to allocate %x bytes of WC pages\n", __FUNCTION__, size));
+                return FALSE;
+            }
+            m_pVAddr = MmMapLockedPagesSpecifyCache(m_pMdl,
+                                                    KernelMode,
+                                                    MmWriteCombined,
+                                                    NULL,
+                                                    FALSE,
+                                                    NormalPagePriority | MdlMappingNoExecute);
+            if (!m_pVAddr)
+            {
+                DbgPrint(TRACE_LEVEL_FATAL, ("%s failed to map WC pages\n", __FUNCTION__));
+                MmFreePagesFromMdl(m_pMdl);
+                ExFreePool(m_pMdl);
+                m_pMdl = NULL;
+                return FALSE;
+            }
+            RtlZeroMemory(m_pVAddr, size);
+            m_bWCAlloc = TRUE;
+            m_bSystemMemory = TRUE;
         }
-        RtlZeroMemory(m_pVAddr, size);
-        m_bSystemMemory = TRUE;
+        else
+        {
+            m_pVAddr = new (NonPagedPoolNx) BYTE[size];
+
+            if (!m_pVAddr)
+            {
+                DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate %x bytes\n", __FUNCTION__, size));
+                return FALSE;
+            }
+            RtlZeroMemory(m_pVAddr, size);
+            m_bSystemMemory = TRUE;
+        }
     }
     else
     {
@@ -989,24 +1089,28 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
         m_bMapped = TRUE;
     }
 
-    m_pMdl = IoAllocateMdl(m_pVAddr, size, FALSE, FALSE, NULL);
-    if (!m_pMdl)
+    if (!m_bWCAlloc) // the WC path built its MDL (locked pages) at allocation time
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate MDLs\n", __FUNCTION__));
-        return FALSE;
-    }
-    if (m_bSystemMemory == TRUE)
-    {
-        __try
+        m_pMdl = IoAllocateMdl(m_pVAddr, size, FALSE, FALSE, NULL);
+        if (!m_pMdl)
         {
-            MmProbeAndLockPages(m_pMdl, KernelMode, IoWriteAccess);
-        }
-#pragma prefast(suppress : __WARNING_EXCEPTIONEXECUTEHANDLER, "try/except is only able to protect against user-mode errors and these are the only errors we try to catch here");
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            DbgPrint(TRACE_LEVEL_FATAL, ("%s Failed to lock pages with error %x\n", __FUNCTION__, GetExceptionCode()));
-            IoFreeMdl(m_pMdl);
+            DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate MDLs\n", __FUNCTION__));
             return FALSE;
+        }
+        if (m_bSystemMemory == TRUE)
+        {
+            __try
+            {
+                MmProbeAndLockPages(m_pMdl, KernelMode, IoWriteAccess);
+            }
+#pragma prefast(suppress : __WARNING_EXCEPTIONEXECUTEHANDLER, "try/except is only able to protect against user-mode errors and these are the only errors we try to catch here");
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                DbgPrint(TRACE_LEVEL_FATAL,
+                         ("%s Failed to lock pages with error %x\n", __FUNCTION__, GetExceptionCode()));
+                IoFreeMdl(m_pMdl);
+                return FALSE;
+            }
         }
     }
     m_pSGList = reinterpret_cast<PSCATTER_GATHER_LIST>(new (NonPagedPoolNx) BYTE[sglsize]);
@@ -1062,26 +1166,45 @@ void VioGpuMemSegment::Close(void)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
-    if (m_pMdl)
+    if (m_bWCAlloc)
     {
-        if (m_bSystemMemory)
+        // Mirror of the WC allocation: unmap the WC view, then release the MDL-owned pages.
+        if (m_pMdl)
         {
-            MmUnlockPages(m_pMdl);
+            if (m_pVAddr)
+            {
+                MmUnmapLockedPages(m_pVAddr, m_pMdl);
+            }
+            MmFreePagesFromMdl(m_pMdl);
+            ExFreePool(m_pMdl);
+            m_pMdl = NULL;
         }
-        IoFreeMdl(m_pMdl);
-        m_pMdl = NULL;
-    }
-
-    if (m_bSystemMemory)
-    {
-        delete[] reinterpret_cast<PBYTE>(m_pVAddr);
+        m_pVAddr = NULL;
+        m_bWCAlloc = FALSE;
     }
     else
     {
-        UnmapFrameBuffer(m_pVAddr, (ULONG)m_Size);
-        m_bMapped = FALSE;
+        if (m_pMdl)
+        {
+            if (m_bSystemMemory)
+            {
+                MmUnlockPages(m_pMdl);
+            }
+            IoFreeMdl(m_pMdl);
+            m_pMdl = NULL;
+        }
+
+        if (m_bSystemMemory)
+        {
+            delete[] reinterpret_cast<PBYTE>(m_pVAddr);
+        }
+        else
+        {
+            UnmapFrameBuffer(m_pVAddr, (ULONG)m_Size);
+            m_bMapped = FALSE;
+        }
+        m_pVAddr = NULL;
     }
-    m_pVAddr = NULL;
 
     delete[] reinterpret_cast<PBYTE>(m_pSGList);
     m_pSGList = NULL;
