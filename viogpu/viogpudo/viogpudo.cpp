@@ -988,14 +988,38 @@ NTSTATUS VioGpuDod::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTER
     PAGED_CODE();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-    UNREFERENCED_PARAMETER(pVidPnPinnedSourceModeInfo);
+    UNREFERENCED_PARAMETER(SourceId);
 
     D3DKMDT_VIDPN_TARGET_MODE *pVidPnTargetModeInfo = NULL;
     NTSTATUS Status = STATUS_SUCCESS;
 
-    for (UINT ModeIndex = 0; ModeIndex < m_pHWDevice->GetModeCount(); ++ModeIndex)
+    // SUPERSET of target modes: when the OS pinned a SOURCE mode, a target of EXACTLY that size first (marked
+    // PREFERRED), then every supported mode. The equal-size target guarantees a pinned commit matches with
+    // IDENTITY scaling (never source!=target), and the full list keeps a commit of ANY size possible — the
+    // client-driven resizes are arbitrary sizes. Two dead ends, documented so nobody retries them: a pinned-only
+    // set broke custom-size resizes (no cofunctional target for sizes outside the pinned one), and the MS-sample
+    // semantics (single target = current committed mode) produced source!=target commits through CENTERED
+    // scaling that this driver's commit path does not handle (stride shear). The one leftover is cosmetic: the
+    // "active signal mode" Windows shows may lag or pick a stale mode; fixing that for real means teaching the
+    // commit path about source!=target first.
+    VIDEO_MODE_INFORMATION pinnedModeInfo;
+    UINT extraPinned = 0;
+    if (pVidPnPinnedSourceModeInfo != NULL)
     {
-        PVIDEO_MODE_INFORMATION pModeInfo = m_pHWDevice->GetModeInfo(SourceId);
+        RtlZeroMemory(&pinnedModeInfo, sizeof(pinnedModeInfo));
+        pinnedModeInfo.VisScreenWidth = pVidPnPinnedSourceModeInfo->Format.Graphics.VisibleRegionSize.cx;
+        pinnedModeInfo.VisScreenHeight = pVidPnPinnedSourceModeInfo->Format.Graphics.VisibleRegionSize.cy;
+        extraPinned = 1;
+    }
+
+    const UINT modeCount = m_pHWDevice->GetModeCount() + extraPinned;
+    for (UINT ModeIndex = 0; ModeIndex < modeCount; ++ModeIndex)
+    {
+        // Index 0 = the pinned-size mode (when present), then the full mode list. A duplicate of the pinned size
+        // in the list is rejected by pfnAddMode as ALREADY_IN_MODESET, which the loop already tolerates.
+        PVIDEO_MODE_INFORMATION pModeInfo = (extraPinned != 0 && ModeIndex == 0)
+                                                ? &pinnedModeInfo
+                                                : m_pHWDevice->GetModeInfo(ModeIndex - extraPinned);
         pVidPnTargetModeInfo = NULL;
         Status = pVidPnTargetModeSetInterface->pfnCreateNewModeInfo(hVidPnTargetModeSet, &pVidPnTargetModeInfo);
         if (!NT_SUCCESS(Status))
@@ -1008,7 +1032,9 @@ NTSTATUS VioGpuDod::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTER
         }
         BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);   // sets ActiveSize itself now
 
-        if (pModeInfo->VisScreenWidth == NOM_WIDTH_SIZE && pModeInfo->VisScreenHeight == NOM_HEIGHT_SIZE)
+        if ((extraPinned != 0 && ModeIndex == 0) ||
+            (extraPinned == 0 && pModeInfo->VisScreenWidth == NOM_WIDTH_SIZE &&
+             pModeInfo->VisScreenHeight == NOM_HEIGHT_SIZE))
         {
             pVidPnTargetModeInfo->Preference = D3DKMDT_MP_PREFERRED;
         }
@@ -3653,6 +3679,77 @@ void VioGpuAdapter::FixEdid(void)
 // once the primary became an external output (an internal panel had a fixed DPI; an external one derives DPI from
 // the EDID physical size). Windows reads the size from TWO places — block-0 bytes 21/22 (max image size, cm) AND
 // each detailed-timing descriptor's mm image size — so both are cleared, then the block-0 checksum is recomputed.
+// Make sure the EDID carries a "Display Product Name" descriptor (tag 0xFC): that string is the monitor name
+// Windows parses (WmiMonitorID.UserFriendlyName, advanced display settings). HOST-FIRST, like the refresh rate:
+// when the host EDID already has a name (QEMU writes one — "QEMU Monitor" by default, qemu_edid_info.name), it
+// is KEPT — the host stays the author and can brand the monitors itself. Only an EDID with no name descriptor
+// gets the same "QEMU Monitor" text stamped as a fallback, into the last non-timing, non-range-limits
+// descriptor. Runs BEFORE NeutralizeEdidPhysicalSize, which recomputes the block checksum.
+static void SetEdidMonitorName(BYTE *edid)
+{
+    if (edid == NULL)
+    {
+        return;
+    }
+    for (int d = 54; d <= 108; d += 18) // host-authored name present? keep it.
+    {
+        if (edid[d] == 0 && edid[d + 1] == 0 && edid[d + 3] == 0xFC)
+        {
+            return;
+        }
+    }
+    int slot = 0;
+    for (int d = 108; d >= 54 && slot == 0; d -= 18) // last non-timing, non-range-limits descriptor
+    {
+        if (edid[d] == 0 && edid[d + 1] == 0 && edid[d + 3] != 0xFD)
+        {
+            slot = d;
+        }
+    }
+    if (slot == 0)
+    {
+        return; // all four descriptors are detailed timings: nowhere safe to write a name
+    }
+    edid[slot] = 0;
+    edid[slot + 1] = 0;
+    edid[slot + 2] = 0;
+    edid[slot + 3] = 0xFC;
+    edid[slot + 4] = 0;
+    static const char name[] = "QEMU Monitor"; // 12 chars + the 0x0A terminator = the descriptor's 13 text bytes
+    BYTE text[13];
+    for (int i = 0; i < 12; i++)
+    {
+        text[i] = (BYTE)name[i];
+    }
+    text[12] = 0x0A;
+    RtlCopyMemory(&edid[slot + 5], text, sizeof(text));
+}
+
+// Relax the monitor range-limits descriptor (tag 0xFD): QEMU's generated EDID caps the max dot clock around
+// 250 MHz, and since the driver reports REAL frequencies (VSync control), Windows validates every mode's pixel
+// rate against that cap — 3440x1440@75 (371 MHz) silently vanished from the mode list while 2560x1080@75
+// (207 MHz) survived. A virtual monitor has no analog limits: push vsync/hsync/dot-clock maxima to the field
+// maxima so no mode is pruned. Runs BEFORE NeutralizeEdidPhysicalSize, which recomputes the checksum.
+static void RelaxEdidRangeLimits(BYTE *edid)
+{
+    if (edid == NULL)
+    {
+        return;
+    }
+    for (int d = 54; d <= 108; d += 18)
+    {
+        if (edid[d] == 0 && edid[d + 1] == 0 && edid[d + 3] == 0xFD)
+        {
+            edid[d + 5] = 23;   // min vertical rate (Hz) — generous floor
+            edid[d + 6] = 255;  // max vertical rate (Hz)
+            edid[d + 7] = 15;   // min horizontal rate (kHz)
+            edid[d + 8] = 255;  // max horizontal rate (kHz)
+            edid[d + 9] = 255;  // max dot clock, x10 MHz -> 2550 MHz
+            return;
+        }
+    }
+}
+
 static void NeutralizeEdidPhysicalSize(BYTE *edid)
 {
     if (edid == NULL)
@@ -3751,6 +3848,8 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
     {
         if (m_bEDID[i])
         {
+            SetEdidMonitorName(m_EDIDs[i]);        // ensure a monitor name (before the checksum recompute)
+            RelaxEdidRangeLimits(m_EDIDs[i]);      // no mode pruning against QEMU's conservative analog limits
             NeutralizeEdidPhysicalSize(m_EDIDs[i]);
         }
     }
@@ -3796,6 +3895,8 @@ BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
             m_EDIDs[scanId][12] = (BYTE)(m_EDIDs[scanId][12] + scanId);       // serial byte
             m_EDIDs[scanId][127] = (BYTE)(m_EDIDs[scanId][127] - 2 * scanId); // keep block-0 checksum == 0
         }
+        SetEdidMonitorName(m_EDIDs[scanId]);           // ensure a monitor name (before the checksum recompute)
+        RelaxEdidRangeLimits(m_EDIDs[scanId]);         // no mode pruning against QEMU's conservative analog limits
         NeutralizeEdidPhysicalSize(m_EDIDs[scanId]);   // force 100% scaling (recomputes checksum, so run last)
         m_bEDID[scanId] = TRUE;
         got = TRUE;
