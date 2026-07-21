@@ -51,6 +51,14 @@ powershell -ExecutionPolicy Bypass -File .\viogpu-stress.ps1 -PnpCycles 25 -Mode
 
 The upstream AutoHCK playlist (Red Hat CI) is the reference this harness approximates.
 
+## Signing & sponsoring
+
+These builds are self-signed: loading them requires test signing or a CKS/Secure Boot setup in the
+guest. Producing drivers that load on a stock Windows (attestation signing through the Microsoft
+Hardware Dev Center) requires an **EV code-signing certificate** — a few hundred euros per year that
+this project currently doesn't have. If this fork is useful to you and you'd like to see properly
+signed releases, sponsoring the certificate is the single most useful contribution. 🙂
+
 ## Building
 
 Built with the EWDK (`build.bat viogpu.sln "Win11" x64 /Rebuild`). The driver version lives in
