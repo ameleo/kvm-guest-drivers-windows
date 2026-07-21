@@ -1,5 +1,11 @@
 # KVM/QEMU Windows guest drivers (virtio-win) #
 
+> **Ameleo fork** — not the official repository (the official one is
+> [virtio-win/kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows)).
+> This fork extends the **viogpu** display driver for remote-desktop/DaaS use:
+> multi-monitor, guest-RAM blob scanout, VSync control and more —
+> see **[viogpu/README.md](viogpu/README.md)** for the feature table.
+
 This repository contains KVM/QEMU Windows guest drivers, for both
 paravirtual and emulated hardware. The code builds and ships as part
 of the virtio-win RPM on Fedora and Red Hat Enterprise Linux, and the
