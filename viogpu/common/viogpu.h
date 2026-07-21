@@ -58,6 +58,9 @@ enum virtio_gpu_ctrl_type
     VIRTIO_GPU_CMD_GET_CAPSET_INFO,
     VIRTIO_GPU_CMD_GET_CAPSET,
     VIRTIO_GPU_CMD_GET_EDID,
+    VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID,   // 0x010b (placeholder — keeps the blob opcodes spec-aligned)
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,   // 0x010c
+    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,       // 0x010d
 
     /* 3d commands */
     VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
@@ -222,6 +225,49 @@ typedef struct virtio_gpu_resource_detach_backing
 } GPU_RES_DETACH_BACKING, *PGPU_RES_DETACH_BACKING;
 #pragma pack()
 
+/* blob resource memory types (RESOURCE_CREATE_BLOB.blob_mem) */
+#define VIRTIO_GPU_BLOB_MEM_GUEST        0x0001
+#define VIRTIO_GPU_BLOB_MEM_HOST3D       0x0002
+#define VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST 0x0003
+
+/* blob resource flags (RESOURCE_CREATE_BLOB.blob_flags) */
+#define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE     0x0001
+#define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE    0x0002
+#define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+
+/* VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: create a blob resource; the mem entries (guest pages) follow the
+   command as data, exactly like ATTACH_BACKING. For MEM_GUEST the host wraps those pages with udmabuf and
+   exports them as a dmabuf scanout — no per-frame TRANSFER_TO_HOST copy, no host GL upload. */
+#pragma pack(1)
+typedef struct virtio_gpu_resource_create_blob
+{
+    GPU_CTRL_HDR hdr;
+    ULONG resource_id;
+    ULONG blob_mem;
+    ULONG blob_flags;
+    ULONG nr_entries;
+    ULONGLONG blob_id;
+    ULONGLONG size;
+} GPU_RES_CREATE_BLOB, *PGPU_RES_CREATE_BLOB;
+#pragma pack()
+
+/* VIRTIO_GPU_CMD_SET_SCANOUT_BLOB */
+#pragma pack(1)
+typedef struct virtio_gpu_set_scanout_blob
+{
+    GPU_CTRL_HDR hdr;
+    GPU_RECT r;
+    ULONG scanout_id;
+    ULONG resource_id;
+    ULONG width;
+    ULONG height;
+    ULONG format;
+    ULONG padding;
+    ULONG strides[4];
+    ULONG offsets[4];
+} GPU_SET_SCANOUT_BLOB, *PGPU_SET_SCANOUT_BLOB;
+#pragma pack()
+
 /* VIRTIO_GPU_RESP_OK_DISPLAY_INFO */
 #define VIRTIO_GPU_MAX_SCANOUTS 16
 #pragma pack(1)
@@ -325,8 +371,9 @@ typedef struct _COLOR_CHARACTERISTICS
 
 #pragma pack(pop)
 
-#define VIRTIO_GPU_F_VIRGL 0
-#define VIRTIO_GPU_F_EDID  1
+#define VIRTIO_GPU_F_VIRGL         0
+#define VIRTIO_GPU_F_EDID          1
+#define VIRTIO_GPU_F_RESOURCE_BLOB 3   // guest-memory blob scanout (udmabuf dmabuf export, no host GL upload)
 
 #define ISR_REASON_DISPLAY 1
 #define ISR_REASON_CURSOR  2

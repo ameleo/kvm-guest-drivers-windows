@@ -243,6 +243,10 @@ class CtrlQueue : public VioGpuQueue
     void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y, BOOLEAN wait = FALSE);
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
     void DetachBacking(UINT id);
+    // Blob scanout path (VIRTIO_GPU_F_RESOURCE_BLOB). CreateResourceBlob takes ownership of ents (freed by the
+    // queue completion, like AttachBacking) — the caller must NOT free them.
+    void CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size);
+    void SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);
     BOOLEAN AskDisplayInfo(PGPU_VBUFFER *buf);
