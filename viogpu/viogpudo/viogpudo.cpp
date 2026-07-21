@@ -930,7 +930,16 @@ VOID VioGpuDod::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo
     pVideoSignalInfo->VideoStandard = D3DKMDT_VSS_OTHER;
     pVideoSignalInfo->TotalSize.cx = pModeInfo->VisScreenWidth;
     pVideoSignalInfo->TotalSize.cy = pModeInfo->VisScreenHeight;
+    // Real ActiveSize is safe (isolated: v208 passed). The baseline copied it from TotalSize BEFORE TotalSize was
+    // filled, so the panel showed an active signal of "-1 x -1".
+    pVideoSignalInfo->ActiveSize = pVideoSignalInfo->TotalSize;
 
+    // The frequencies MUST stay NOTSPECIFIED. Proven by isolation (v209): reporting a concrete rate — even a clean
+    // hardcoded 60/1 with matching HSync/PixelRate — breaks the display on Win11. A concrete refresh makes dxgkrnl
+    // engage vsync scheduling, which a DOD without the vsync-interrupt machinery (DxgkDdiControlInterrupt +
+    // DxgkDdiGetScanLine + a timer raising CRTC_VSYNC) cannot honor; qxl-wddm-dod documents the same trap (watchdog,
+    // Code 43) and ships its complete implementation DISABLED by default. NOTSPECIFIED acts as a wildcard and is the
+    // safe contract for a DOD.
     pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     pVideoSignalInfo->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     pVideoSignalInfo->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
@@ -965,8 +974,7 @@ NTSTATUS VioGpuDod::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INTER
                       LONG_PTR(hVidPnTargetModeSet)));
             return Status;
         }
-        pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize = pVidPnTargetModeInfo->VideoSignalInfo.TotalSize;
-        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);
+        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);   // sets ActiveSize itself now
 
         if (pModeInfo->VisScreenWidth == NOM_WIDTH_SIZE && pModeInfo->VisScreenHeight == NOM_HEIGHT_SIZE)
         {
