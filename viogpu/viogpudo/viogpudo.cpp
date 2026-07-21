@@ -3842,6 +3842,20 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
         }
     }
 
+    // Distinctness for REAL per-head EDIDs too: QEMU can hand the SAME identity block (manufacturer + product +
+    // serial, bytes 8..15) to every scanout it enables at boot. The copy-of-primary fallback above and
+    // RefreshEdid (hotplug arrival) already nudge colliding identities, but a real EDID received at BOOT skipped
+    // it -> Windows CONFLATES the twin monitors (non-deterministic extend, mixed-up heads). Nudge any
+    // non-primary head whose identity matches head 0. (Checksum is recomputed below.)
+    for (UINT32 i = 1; i < numScanouts; i++)
+    {
+        if (m_bEDID[i] && m_bEDID[0] && RtlCompareMemory(&m_EDIDs[i][8], &m_EDIDs[0][8], 8) == 8)
+        {
+            m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i); // product code low byte (distinct model)
+            m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i); // serial byte
+        }
+    }
+
     // Force 100% scaling: strip the physical size from every head's EDID (recomputes the checksum, so it runs
     // AFTER the distinct-identity nudge above). Windows then has no basis for a >96 DPI recommendation.
     for (UINT32 i = 0; i < numScanouts; i++)
