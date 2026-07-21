@@ -102,7 +102,11 @@ class VioGpuMemSegment
     {
         return m_pSGList;
     }
-    BOOLEAN Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr);
+    // bWriteCombined: allocate the system-memory backing via MDL pages mapped WRITE-COMBINED instead of cached
+    // pool — real-hardware framebuffer semantics. Streaming CPU writes stay fast, nothing lands in the CPU cache,
+    // and with KVM honoring the guest PAT the host sees WC pages: an i915 dmabuf import of the udmabuf then has
+    // no CPU cache to flush (kills the host-side wbinvd storms). Only for buffers that are WRITTEN, never read.
+    BOOLEAN Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr, _In_ BOOLEAN bWriteCombined = FALSE);
     BOOLEAN IsSystemMemory(void)
     {
         return m_bSystemMemory;
@@ -112,6 +116,7 @@ class VioGpuMemSegment
   private:
     BOOLEAN m_bSystemMemory;
     BOOLEAN m_bMapped;
+    BOOLEAN m_bWCAlloc; // pages from MmAllocatePagesForMdlEx, mapped WRITE-COMBINED (frees differ — see Close)
     PSCATTER_GATHER_LIST m_pSGList;
     PVOID m_pVAddr;
     PMDL m_pMdl;
@@ -251,6 +256,13 @@ class CtrlQueue : public VioGpuQueue
     void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y, BOOLEAN wait = FALSE);
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
     void DetachBacking(UINT id);
+    // Blob scanout path (VIRTIO_GPU_F_RESOURCE_BLOB). CreateResourceBlob takes ownership of ents (freed by the
+    // queue completion, like AttachBacking) — the caller must NOT free them. It waits for the host's answer and
+    // returns FALSE when the host refused the resource. SetScanoutBlob does the same when wait is TRUE, and
+    // returns TRUE without waiting otherwise (the per-present flip).
+    BOOLEAN CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size);
+    BOOLEAN SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride,
+                           BOOLEAN wait = FALSE);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);
     BOOLEAN AskDisplayInfo(PGPU_VBUFFER *buf);
@@ -258,6 +270,8 @@ class CtrlQueue : public VioGpuQueue
     BOOLEAN GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid);
 
   private:
+    BOOLEAN QueueAndCheck(PGPU_VBUFFER vbuf, UINT res_id, const char *what);
+
     volatile LONG m_FenceIdr;
 };
 
