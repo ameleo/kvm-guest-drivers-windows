@@ -453,6 +453,63 @@ void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
 
 PAGED_CODE_SEG_END
 
+// NONPAGED like SetScanout/DetachBacking/DestroyResource: both blob functions run in DestroyFrameBufferObj, which
+// the bugcheck flow (ResetToVgaMode) may enter at elevated IRQL — paged code there would double-fault.
+
+// Create a blob resource. The guest pages (ents) ride as command data, like ATTACH_BACKING, and the queue
+// completion frees them (FreeBuf) — the caller must NOT free ents.
+void CtrlQueue::CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_CREATE_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_CREATE_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cmd->resource_id = res_id;
+    cmd->blob_mem = blob_mem;
+    cmd->blob_flags = blob_flags;
+    cmd->nr_entries = nents;
+    cmd->blob_id = 0;   // MEM_GUEST: no host-side blob id
+    cmd->size = size;
+
+    vbuf->data_buf = ents;
+    vbuf->data_size = sizeof(*ents) * nents;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_SET_SCANOUT_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_SET_SCANOUT_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+    cmd->scanout_id = scan_id;
+    cmd->resource_id = res_id;
+    cmd->format = format;
+    cmd->width = width;
+    cmd->height = height;
+    cmd->r.x = 0;
+    cmd->r.y = 0;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->strides[0] = stride;
+    cmd->offsets[0] = 0;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
 void CtrlQueue::DestroyResource(UINT res_id)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
