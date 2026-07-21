@@ -306,11 +306,8 @@ void GpuAdapter::SyncResolution(void)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
-    // Serialize across the per-display agent instances. SetDisplayConfig applies
-    // the FULL topology, so two instances resizing concurrently would each push a
-    // stale snapshot and clobber the other head. Holding one lock while we
-    // re-query the current config and change only our own path keeps the other
-    // head stable when both instances update concurrently.
+    // Serialize across the per-display agent instances: each one re-queries the display config and changes its
+    // own head, and two of them doing it at once would read a config the other is changing.
     HANDLE hLock = CreateMutex(NULL, FALSE, L"VioGpuResizeLock");
     BOOL owned = FALSE;
     if (hLock)
@@ -331,15 +328,20 @@ void GpuAdapter::SyncResolution(void)
     {
         VIOGPU_DISP_MODE current = {0};
         GetCurrentResolution(&current);
-        // Apply ONLY when the requested size actually differs from what is already applied: SetResolution
-        // re-applies the FULL topology via SetDisplayConfig, which itself fires another resolution event, so a
-        // blind re-apply on every event would feed back into itself and fight Windows' own topology handling.
-        // Skipping the no-op re-apply breaks that loop while still following genuine client resizes.
+        // Apply ONLY when the requested size actually differs from what is already applied: a mode change fires
+        // another resolution event, so a blind re-apply on every event would feed back into itself. Skipping the
+        // no-op re-apply breaks that loop while still following genuine client resizes.
         if (custom.XResolution != current.XResolution || custom.YResolution != current.YResolution)
         {
             SetResolution(&custom);
         }
     }
+
+    // Wake a STATIC head after a no-op sync: when a client (re)connects asking for the size a head already has,
+    // nothing above changes anything, so nothing wakes DWM — a never-painted head stays black until the first
+    // user-generated damage (a click). Invalidating every window forces a full repaint -> DWM presents -> the
+    // driver flips -> the host stream gets a real frame. Cheap, and a genuine resize repaints anyway.
+    InvalidateRect(NULL, NULL, TRUE);
 
     if (hLock)
     {
