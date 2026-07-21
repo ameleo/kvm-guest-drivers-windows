@@ -1,5 +1,12 @@
 # viogpu — VirtIO GPU display-only driver (Ameleo fork)
 
+> **⚠️ This is not the official virtio-win driver.** This repository is [Ameleo](https://www.ameleo.fr)'s
+> fork of the official [virtio-win/kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows)
+> project. The viogpu driver on this branch carries features that are **not upstream** (multi-monitor,
+> blob scanout, VSync control) and is not WHQL-signed. For the official drivers, use the
+> [virtio-win releases](https://github.com/virtio-win/kvm-guest-drivers-windows/releases) or your
+> distribution's virtio-win packages.
+
 Windows display-only (KMDOD) driver for the QEMU/KVM `virtio-vga` / `virtio-gpu-pci` device,
 based on [virtio-win/kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows),
 extended for remote-desktop / DaaS use: multi-monitor, arbitrary client-driven resolutions,
