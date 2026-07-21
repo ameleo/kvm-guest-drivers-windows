@@ -109,6 +109,10 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
     InitialData.DxgkDdiStopDeviceAndReleasePostDisplayOwnership = VioGpuDodStopDeviceAndReleasePostDisplayOwnership;
     InitialData.DxgkDdiSystemDisplayEnable = VioGpuDodSystemDisplayEnable;
     InitialData.DxgkDdiSystemDisplayWrite = VioGpuDodSystemDisplayWrite;
+    // VSync control (all-or-nothing KMDOD contract): these two DDIs go together with the REAL frequencies
+    // reported in the video signal info and the simulated-vblank timer (EnableVsync).
+    InitialData.DxgkDdiControlInterrupt = VioGpuDodControlInterrupt;
+    InitialData.DxgkDdiGetScanLine = VioGpuDodGetScanLine;
 
     NTSTATUS Status = DxgkInitializeDisplayOnlyDriver(pDriverObject, pRegistryPath, &InitialData);
     if (!NT_SUCCESS(Status))
@@ -547,6 +551,34 @@ VioGpuDodQueryVidPnHWCapability(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUER
         return STATUS_UNSUCCESSFUL;
     }
     return pVioGpuDod->QueryVidPnHWCapability(pVidPnHWCaps);
+}
+
+NTSTATUS APIENTRY VioGpuDodControlInterrupt(_In_ CONST HANDLE hAdapter,
+                                            _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
+                                            _In_ BOOLEAN EnableInterrupt)
+{
+    PAGED_CODE();
+    VIOGPU_ASSERT_CHK(hAdapter != NULL);
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+    VioGpuDod *pVioGpuDod = reinterpret_cast<VioGpuDod *>(hAdapter);
+    if (InterruptType == DXGK_INTERRUPT_DISPLAYONLY_VSYNC)
+    {
+        pVioGpuDod->EnableVsync(EnableInterrupt);
+        return STATUS_SUCCESS;
+    }
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS APIENTRY VioGpuDodGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *pGetScanLine)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pGetScanLine);
+    // No real scanout position exists on virtio-gpu. Not implemented, like remote desktop (QXL does the same);
+    // dxgkrnl copes with this as long as the vsync interrupt itself is delivered.
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 // END: Paged Code
