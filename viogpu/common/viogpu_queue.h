@@ -102,7 +102,11 @@ class VioGpuMemSegment
     {
         return m_pSGList;
     }
-    BOOLEAN Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr);
+    // bWriteCombined: allocate the system-memory backing via MDL pages mapped WRITE-COMBINED instead of cached
+    // pool — real-hardware framebuffer semantics. Streaming CPU writes stay fast, nothing lands in the CPU cache,
+    // and with KVM honoring the guest PAT the host sees WC pages: an i915 dmabuf import of the udmabuf then has
+    // no CPU cache to flush (kills the host-side wbinvd storms). Only for buffers that are WRITTEN, never read.
+    BOOLEAN Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr, _In_ BOOLEAN bWriteCombined = FALSE);
     BOOLEAN IsSystemMemory(void)
     {
         return m_bSystemMemory;
@@ -112,6 +116,7 @@ class VioGpuMemSegment
   private:
     BOOLEAN m_bSystemMemory;
     BOOLEAN m_bMapped;
+    BOOLEAN m_bWCAlloc; // pages from MmAllocatePagesForMdlEx, mapped WRITE-COMBINED (frees differ — see Close)
     PSCATTER_GATHER_LIST m_pSGList;
     PVOID m_pVAddr;
     PMDL m_pMdl;
