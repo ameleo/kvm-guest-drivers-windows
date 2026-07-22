@@ -1,10 +1,31 @@
-# KVM/QEMU Windows guest drivers (virtio-win) #
+# Ameleo fork — an extended viogpu display driver
 
-> **Ameleo fork** — not the official repository (the official one is
-> [virtio-win/kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows)).
-> This fork extends the **viogpu** display driver for remote-desktop/DaaS use:
-> multi-monitor, guest-RAM blob scanout, VSync control and more —
-> see **[viogpu/README.md](viogpu/README.md)** for the feature table.
+This is [Ameleo](https://www.ameleo.fr)'s fork of the official
+[virtio-win/kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows)
+project. **Everything this fork adds lives in the [`viogpu/`](viogpu/) display driver** — the
+other drivers are unchanged upstream code, kept because viogpu builds on the repository's shared
+VirtIO library and build system.
+
+**➜ Start here: [viogpu/README.md](viogpu/README.md)** — the complete feature table, host
+requirements, known limitations, testing and build instructions.
+
+Highlights over the upstream viogpu:
+
+- **Multi-monitor** extend with per-head hotplug, per-head EDIDs and arbitrary client-driven
+  resolutions (remote-desktop/DaaS oriented);
+- **Guest-RAM blob scanout** — zero-copy display path over udmabuf, with a write-combined
+  framebuffer (no host-side CPU cache flushes);
+- **VSync control** with a simulated vblank — EDID-driven refresh rate, notified per target
+  (works multi-head, which the reference implementations never achieved).
+
+Branches: `viogpu-multihead` (multi-monitor base) and `viogpu-blob` (full feature set, derived
+from it). Builds are self-signed — see the signing notes in the viogpu README.
+
+The original upstream README follows.
+
+---
+
+# KVM/QEMU Windows guest drivers (virtio-win) #
 
 This repository contains KVM/QEMU Windows guest drivers, for both
 paravirtual and emulated hardware. The code builds and ships as part
