@@ -2558,8 +2558,9 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
         KeInitializeGuardedMutex(&m_FrameBufLock[scan]);
     m_pCursorBuf = NULL;
     KeInitializeGuardedMutex(&m_CursorMutex);
-    // No sprite is attached until the first shape is set.
-    m_bCursorHidden = TRUE;
+    // No sprite is attached until the first shape is set, on any head.
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+        m_bCursorHidden[scan] = TRUE;
     m_CursorHotX = 0;
     m_CursorHotY = 0;
     m_PendingWorks = 0;
@@ -3413,7 +3414,7 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         // Remember the hot spot for the UPDATE_CURSOR that re-attaches the sprite after a later hide.
         m_CursorHotX = pSetPointerShape->XHot;
         m_CursorHotY = pSetPointerShape->YHot;
-        m_bCursorHidden = FALSE;
+        m_bCursorHidden[pSetPointerShape->VidPnSourceId] = FALSE;
         ret = m_CursorQueue.QueueCursor(vbuf);
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
@@ -3443,6 +3444,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
     KeAcquireGuardedMutex(&m_CursorMutex);
     if (m_pCursorBuf != NULL)
     {
+        UINT src = (UINT)pSetPointerPosition->VidPnSourceId;
         // Out-of-range coordinates are treated as invisible, as before.
         BOOLEAN visible = pSetPointerPosition->Flags.Visible && pSetPointerPosition->X >= 0 &&
                           pSetPointerPosition->Y >= 0 && (UINT)pSetPointerPosition->X <= pModeCur->SrcModeWidth &&
@@ -3456,11 +3458,37 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                   pSetPointerPosition->Flags.Visible,
                   pSetPointerPosition->Flags.Value,
                   pSetPointerPosition->VidPnSourceId,
-                  m_bCursorHidden));
+                  m_bCursorHidden[src]));
 
-        if (!visible && m_bCursorHidden)
+        BOOLEAN sendCmd = TRUE;
+        if (!visible)
         {
-            // Already hidden, nothing to send.
+            if (m_bCursorHidden[src])
+            {
+                // Already hidden, nothing to send.
+                sendCmd = FALSE;
+            }
+            else
+            {
+                // Windows hides a head's pointer for two reasons. In a window move or resize loop every
+                // connected head ends hidden: send the hide, so a remote client can blank its own cursor.
+                // When the pointer merely leaves this head for another, some head stays visible: send
+                // nothing, since each head has its own cursor channel and an untagged hide racing the next
+                // head's UPDATE_CURSOR would blank the remote cursor.
+                m_bCursorHidden[src] = TRUE;
+                for (UINT i = 0; i < GetNumScanouts(); i++)
+                {
+                    if (m_bConnected[i] && !m_bCursorHidden[i])
+                    {
+                        sendCmd = FALSE;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!sendCmd)
+        {
             status = STATUS_SUCCESS;
         }
         else
@@ -3470,7 +3498,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             UINT ret = 0;
             crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
             RtlZeroMemory(crsr, sizeof(*crsr));
-            crsr->pos.scanout_id = (ULONG)pSetPointerPosition->VidPnSourceId;
+            crsr->pos.scanout_id = (ULONG)src;
 
             if (!visible)
             {
@@ -3478,9 +3506,8 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                 // attached: a parked sprite stays visible in the top left corner of the display.
                 crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
                 crsr->resource_id = 0;
-                m_bCursorHidden = TRUE;
             }
-            else if (m_bCursorHidden)
+            else if (m_bCursorHidden[src])
             {
                 // Coming back from a hide: MOVE_CURSOR does not re-associate a detached resource, so the
                 // sprite must be re-attached with a full UPDATE_CURSOR. The image itself is still
@@ -3491,7 +3518,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                 crsr->pos.y = pSetPointerPosition->Y;
                 crsr->hot_x = m_CursorHotX;
                 crsr->hot_y = m_CursorHotY;
-                m_bCursorHidden = FALSE;
+                m_bCursorHidden[src] = FALSE;
             }
             else
             {
