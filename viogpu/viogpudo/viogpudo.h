@@ -236,6 +236,21 @@ class VioGpuAdapter : IVioGpuPCI
     // the lock. See DestroyFrameBufferObj / ExecutePresentDisplayOnly.
     KGUARDED_MUTEX m_FrameBufLock[MAX_SCANOUTS];
     VioGpuObj *m_pCursorBuf;
+    // Serializes SetPointerShape vs SetPointerPosition: dxgkrnl calls the two pointer DDIs from DIFFERENT threads
+    // (even different processes), unsynchronized. Concurrent runs let a MOVE_CURSOR race the two-step shape update
+    // (control-queue image upload + cursor-queue UPDATE_CURSOR) and reach the device out of order -> stale/stuck
+    // cursor. A guarded mutex makes the two DDIs mutually exclusive (both run at PASSIVE_LEVEL). This is the
+    // documented reason HWCursor was left disabled upstream (virtio-win #977 / RHELMISC-34288).
+    KGUARDED_MUTEX m_CursorMutex;
+    // Pointer visibility state (per source), guarded by m_CursorMutex. Windows really HIDES the HW cursor
+    // (SetPointerPosition Flags.Visible=0) when DWM takes over and composes the pointer into the frame
+    // (window move/size loops — RDP-style), then re-shows it afterwards. Honor the hide with a real
+    // UPDATE_CURSOR resource_id=0 instead of parking the sprite at (0,0): a parked sprite leaks a visible
+    // host/remote cursor on top of the composed one. After a hide the re-show MUST re-attach the resource
+    // with UPDATE_CURSOR — MOVE_CURSOR never re-associates a detached resource.
+    BOOLEAN m_bCursorHidden[MAX_SCANOUTS];
+    UINT m_CursorHotX; // hot spot cached at SetPointerShape for the re-show UPDATE_CURSOR
+    UINT m_CursorHotY;
     VioGpuMemSegment m_CursorSegment;
     VioGpuMemSegment m_FrameSegment[MAX_SCANOUTS];
     UINT m_BlobResidB[MAX_SCANOUTS];   // second blob resource id (double-buffer: ping-pong the scanout A<->B)

@@ -2537,6 +2537,13 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
         KeInitializeGuardedMutex(&m_FrameBufLock[scan]);
     m_pCursorBuf = NULL;
+    KeInitializeGuardedMutex(&m_CursorMutex);
+    // Hidden until a shape/position first shows the sprite on a scanout: the all-heads-hidden test below
+    // must not count a never-visited head as visible.
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+        m_bCursorHidden[scan] = TRUE;
+    m_CursorHotX = 0;
+    m_CursorHotY = 0;
     m_PendingWorks = 0;
     m_bStopWorkThread = FALSE;
     m_pWorkThread = NULL;
@@ -3354,6 +3361,12 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
               pSetPointerShape->XHot,
               pSetPointerShape->YHot));
 
+    // Serialize against SetPointerPosition (see m_CursorMutex): the image upload + UPDATE_CURSOR below must not
+    // interleave with a concurrent MOVE_CURSOR. Both DDIs run at PASSIVE_LEVEL, so the guarded mutex is legal even
+    // across the synchronous transfer inside UpdateCursor.
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    KeAcquireGuardedMutex(&m_CursorMutex);
+
     // Monochrome (and masked-color) cursors are now converted to A8R8G8B8 inside UpdateCursor,
     // so we must NOT reject them here — otherwise Windows falls back to a SOFTWARE cursor
     // composited into the framebuffer (captured into the video/remote stream, laggy + double
@@ -3377,75 +3390,143 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
         crsr->hot_y = pSetPointerShape->YHot;
+        // A full UPDATE_CURSOR (re-)attaches the resource and shows the sprite: the hide state is over for
+        // this source. Cache the hot spot so a later re-show from SetPointerPosition matches this shape.
+        m_CursorHotX = pSetPointerShape->XHot;
+        m_CursorHotY = pSetPointerShape->YHot;
+        m_bCursorHidden[pSetPointerShape->VidPnSourceId] = FALSE;
         ret = m_CursorQueue.QueueCursor(vbuf);
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
         {
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
         }
-        VioGpuDbgBreak();
+        else
+        {
+            VioGpuDbgBreak();
+        }
     }
-    DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Failed to create cursor\n", __FUNCTION__));
-    return STATUS_UNSUCCESSFUL;
+    else
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Failed to create cursor\n", __FUNCTION__));
+    }
+    KeReleaseGuardedMutex(&m_CursorMutex);
+    return status;
 }
 
 NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition,
                                            _In_ CONST CURRENT_MODE *pModeCur)
 {
     PAGED_CODE();
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    // Serialize against SetPointerShape (see m_CursorMutex).
+    KeAcquireGuardedMutex(&m_CursorMutex);
     if (m_pCursorBuf != NULL)
     {
-        PGPU_UPDATE_CURSOR crsr;
-        PGPU_VBUFFER vbuf;
-        UINT ret = 0;
-        crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
-        RtlZeroMemory(crsr, sizeof(*crsr));
-
-        crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;
-        crsr->resource_id = m_pCursorBuf->GetId();
         // Head index from DXGK (bounded < GetNumScanouts() by the dispatcher), not the possibly-uninitialized
         // pModeCur->DispInfo.TargetId — see SetPointerShape for the rationale.
-        crsr->pos.scanout_id = (ULONG)pSetPointerPosition->VidPnSourceId;
+        UINT src = (UINT)pSetPointerPosition->VidPnSourceId;
+        // Out-of-range coordinates are treated as invisible on this scanout, like the Visible flag.
+        BOOLEAN visible = pSetPointerPosition->Flags.Visible && pSetPointerPosition->X >= 0 &&
+                          pSetPointerPosition->Y >= 0 &&
+                          (UINT)pSetPointerPosition->X <= pModeCur->SrcModeWidth &&
+                          (UINT)pSetPointerPosition->Y <= pModeCur->SrcModeHeight;
 
-        if (!pSetPointerPosition->Flags.Visible || (UINT)pSetPointerPosition->X > pModeCur->SrcModeWidth ||
-            (UINT)pSetPointerPosition->Y > pModeCur->SrcModeHeight || pSetPointerPosition->X < 0 ||
-            pSetPointerPosition->Y < 0)
+        DbgPrint(TRACE_LEVEL_VERBOSE,
+                 ("---> %s (%d - %d) Visible = %d Value = %x VidPnSourceId = %d hidden = %d\n",
+                  __FUNCTION__,
+                  pSetPointerPosition->X,
+                  pSetPointerPosition->Y,
+                  pSetPointerPosition->Flags.Visible,
+                  pSetPointerPosition->Flags.Value,
+                  pSetPointerPosition->VidPnSourceId,
+                  m_bCursorHidden[src]));
+
+        BOOLEAN sendCmd = TRUE;
+        if (!visible)
         {
-            DbgPrint(TRACE_LEVEL_VERBOSE,
-                     ("---> %s (%d - %d) Visiable = %d Value = %x VidPnSourceId = %d\n",
-                      __FUNCTION__,
-                      pSetPointerPosition->X,
-                      pSetPointerPosition->Y,
-                      pSetPointerPosition->Flags.Visible,
-                      pSetPointerPosition->Flags.Value,
-                      pSetPointerPosition->VidPnSourceId));
-            crsr->pos.x = 0;
-            crsr->pos.y = 0;
+            if (m_bCursorHidden[src])
+            {
+                // Already hidden — nothing to send.
+                sendCmd = FALSE;
+            }
+            else
+            {
+                // Distinguish the two reasons Windows hides a head's pointer:
+                //  - GLOBAL hide (window move/size loop: DWM composes the pointer into the frame) — every
+                //    connected head ends hidden. Propagate it (UPDATE_CURSOR resource_id=0) so a remote
+                //    client can blank its local cursor instead of doubling the composed one.
+                //  - the pointer merely LEFT this head for another (multi-head crossing) — some other head
+                //    stays/turns visible. Suppress the device hide: each head has its own cursor channel and
+                //    an untagged hide racing the next head's shape SET blanks the remote cursor for good.
+                //    The stale sprite stays parked on this scanout (invisible to the remote video path;
+                //    local-viewer artifact only) until the pointer comes back and re-attaches.
+                m_bCursorHidden[src] = TRUE;
+                for (UINT i = 0; i < GetNumScanouts(); i++)
+                {
+                    if (m_bConnected[i] && !m_bCursorHidden[i])
+                    {
+                        sendCmd = FALSE; // another head still shows the pointer: crossing, not a global hide
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!sendCmd)
+        {
+            status = STATUS_SUCCESS;
         }
         else
         {
-            DbgPrint(TRACE_LEVEL_VERBOSE,
-                     ("---> %s (%d - %d) Visiable = %d Value = %x VidPnSourceId = %d posX = %d, psY = %d\n",
-                      __FUNCTION__,
-                      pSetPointerPosition->X,
-                      pSetPointerPosition->Y,
-                      pSetPointerPosition->Flags.Visible,
-                      pSetPointerPosition->Flags.Value,
-                      pSetPointerPosition->VidPnSourceId,
-                      pSetPointerPosition->X,
-                      pSetPointerPosition->Y));
-            crsr->pos.x = pSetPointerPosition->X;
-            crsr->pos.y = pSetPointerPosition->Y;
+            PGPU_UPDATE_CURSOR crsr;
+            PGPU_VBUFFER vbuf;
+            UINT ret = 0;
+            crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
+            RtlZeroMemory(crsr, sizeof(*crsr));
+            crsr->pos.scanout_id = (ULONG)src;
+
+            if (!visible)
+            {
+                // Global hide (see above). The old behavior parked the sprite at (0,0) with the resource
+                // attached, leaking a visible host/remote cursor on top of the composed one (two pointers
+                // during every window drag on a remote client).
+                crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+                crsr->resource_id = 0;
+            }
+            else if (m_bCursorHidden[src])
+            {
+                // Re-show after a hide: MOVE_CURSOR never re-associates a detached resource, so re-attach
+                // with a full UPDATE_CURSOR (image already uploaded — only the association is re-created).
+                crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+                crsr->resource_id = m_pCursorBuf->GetId();
+                crsr->pos.x = pSetPointerPosition->X;
+                crsr->pos.y = pSetPointerPosition->Y;
+                crsr->hot_x = m_CursorHotX;
+                crsr->hot_y = m_CursorHotY;
+                m_bCursorHidden[src] = FALSE;
+            }
+            else
+            {
+                crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;
+                crsr->resource_id = m_pCursorBuf->GetId();
+                crsr->pos.x = pSetPointerPosition->X;
+                crsr->pos.y = pSetPointerPosition->Y;
+            }
+            ret = m_CursorQueue.QueueCursor(vbuf);
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
+            if (ret == 0)
+            {
+                status = STATUS_SUCCESS;
+            }
+            else
+            {
+                VioGpuDbgBreak();
+            }
         }
-        ret = m_CursorQueue.QueueCursor(vbuf);
-        DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
-        if (ret == 0)
-        {
-            return STATUS_SUCCESS;
-        }
-        VioGpuDbgBreak();
     }
-    return STATUS_UNSUCCESSFUL;
+    KeReleaseGuardedMutex(&m_CursorMutex);
+    return status;
 }
 
 NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
