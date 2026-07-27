@@ -2315,6 +2315,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_Id = g_InstanceId++;
     m_pFrameBuf = NULL;
     m_pCursorBuf = NULL;
+    KeInitializeGuardedMutex(&m_CursorMutex);
     m_PendingWorks = 0;
     m_bStopWorkThread = FALSE;
     m_pWorkThread = NULL;
@@ -2973,6 +2974,11 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         return STATUS_UNSUCCESSFUL;
     }
 
+    // The image upload and the UPDATE_CURSOR below must not interleave with a concurrent MOVE_CURSOR
+    // issued by SetPointerPosition on another thread (see m_CursorMutex).
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    KeAcquireGuardedMutex(&m_CursorMutex);
+
     if (UpdateCursor(pSetPointerShape, pModeCur))
     {
         PGPU_UPDATE_CURSOR crsr;
@@ -2991,18 +2997,29 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
         {
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
         }
-        VioGpuDbgBreak();
+        else
+        {
+            VioGpuDbgBreak();
+        }
     }
-    DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Failed to create cursor\n", __FUNCTION__));
-    return STATUS_UNSUCCESSFUL;
+    else
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Failed to create cursor\n", __FUNCTION__));
+    }
+
+    KeReleaseGuardedMutex(&m_CursorMutex);
+    return status;
 }
 
 NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition,
                                            _In_ CONST CURRENT_MODE *pModeCur)
 {
     PAGED_CODE();
+    // Serialize against SetPointerShape (see m_CursorMutex).
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    KeAcquireGuardedMutex(&m_CursorMutex);
     if (m_pCursorBuf != NULL)
     {
         PGPU_UPDATE_CURSOR crsr;
@@ -3048,11 +3065,15 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
         DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
         {
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
         }
-        VioGpuDbgBreak();
+        else
+        {
+            VioGpuDbgBreak();
+        }
     }
-    return STATUS_UNSUCCESSFUL;
+    KeReleaseGuardedMutex(&m_CursorMutex);
+    return status;
 }
 
 NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
