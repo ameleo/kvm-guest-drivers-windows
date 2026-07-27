@@ -209,6 +209,13 @@ class VioGpuAdapter : IVioGpuPCI
     // commands reach the device out of order, leaving a stale or stuck cursor. Both DDIs run at
     // PASSIVE_LEVEL, so a guarded mutex is legal here and may be held across the upload.
     KGUARDED_MUTEX m_CursorMutex;
+    // Pointer visibility, guarded by m_CursorMutex. Windows hides the hardware cursor (Flags.Visible = 0)
+    // whenever it draws the pointer itself, for instance while DWM composes it into the primary during a
+    // window move or resize loop, and shows it again afterwards.
+    BOOLEAN m_bCursorHidden;
+    // Hot spot of the current shape, replayed by the UPDATE_CURSOR that re-attaches the sprite after a hide.
+    UINT m_CursorHotX;
+    UINT m_CursorHotY;
     VioGpuMemSegment m_CursorSegment;
     VioGpuMemSegment m_FrameSegment;
     volatile ULONG m_PendingWorks;

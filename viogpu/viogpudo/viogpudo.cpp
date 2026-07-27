@@ -2316,6 +2316,10 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_pFrameBuf = NULL;
     m_pCursorBuf = NULL;
     KeInitializeGuardedMutex(&m_CursorMutex);
+    // No sprite is attached until the first shape is set.
+    m_bCursorHidden = TRUE;
+    m_CursorHotX = 0;
+    m_CursorHotY = 0;
     m_PendingWorks = 0;
     m_bStopWorkThread = FALSE;
     m_pWorkThread = NULL;
@@ -2993,6 +2997,11 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
         crsr->hot_y = pSetPointerShape->YHot;
+        // This UPDATE_CURSOR attaches the resource and shows the sprite, so any pending hide is over.
+        // Remember the hot spot for the UPDATE_CURSOR that re-attaches the sprite after a later hide.
+        m_CursorHotX = pSetPointerShape->XHot;
+        m_CursorHotY = pSetPointerShape->YHot;
+        m_bCursorHidden = FALSE;
         ret = m_CursorQueue.QueueCursor(vbuf);
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
@@ -3022,54 +3031,73 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
     KeAcquireGuardedMutex(&m_CursorMutex);
     if (m_pCursorBuf != NULL)
     {
-        PGPU_UPDATE_CURSOR crsr;
-        PGPU_VBUFFER vbuf;
-        UINT ret = 0;
-        crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
-        RtlZeroMemory(crsr, sizeof(*crsr));
+        // Out-of-range coordinates are treated as invisible, as before.
+        BOOLEAN visible = pSetPointerPosition->Flags.Visible && pSetPointerPosition->X >= 0 &&
+                          pSetPointerPosition->Y >= 0 && (UINT)pSetPointerPosition->X <= pModeCur->SrcModeWidth &&
+                          (UINT)pSetPointerPosition->Y <= pModeCur->SrcModeHeight;
 
-        crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;
-        crsr->resource_id = m_pCursorBuf->GetId();
+        DbgPrint(TRACE_LEVEL_VERBOSE,
+                 ("---> %s (%d - %d) Visible = %d Value = %x VidPnSourceId = %d hidden = %d\n",
+                  __FUNCTION__,
+                  pSetPointerPosition->X,
+                  pSetPointerPosition->Y,
+                  pSetPointerPosition->Flags.Visible,
+                  pSetPointerPosition->Flags.Value,
+                  pSetPointerPosition->VidPnSourceId,
+                  m_bCursorHidden));
 
-        if (!pSetPointerPosition->Flags.Visible || (UINT)pSetPointerPosition->X > pModeCur->SrcModeWidth ||
-            (UINT)pSetPointerPosition->Y > pModeCur->SrcModeHeight || pSetPointerPosition->X < 0 ||
-            pSetPointerPosition->Y < 0)
+        if (!visible && m_bCursorHidden)
         {
-            DbgPrint(TRACE_LEVEL_VERBOSE,
-                     ("---> %s (%d - %d) Visiable = %d Value = %x VidPnSourceId = %d\n",
-                      __FUNCTION__,
-                      pSetPointerPosition->X,
-                      pSetPointerPosition->Y,
-                      pSetPointerPosition->Flags.Visible,
-                      pSetPointerPosition->Flags.Value,
-                      pSetPointerPosition->VidPnSourceId));
-            crsr->pos.x = 0;
-            crsr->pos.y = 0;
-        }
-        else
-        {
-            DbgPrint(TRACE_LEVEL_VERBOSE,
-                     ("---> %s (%d - %d) Visiable = %d Value = %x VidPnSourceId = %d posX = %d, psY = %d\n",
-                      __FUNCTION__,
-                      pSetPointerPosition->X,
-                      pSetPointerPosition->Y,
-                      pSetPointerPosition->Flags.Visible,
-                      pSetPointerPosition->Flags.Value,
-                      pSetPointerPosition->VidPnSourceId,
-                      pSetPointerPosition->X,
-                      pSetPointerPosition->Y));
-            crsr->pos.x = pSetPointerPosition->X;
-            crsr->pos.y = pSetPointerPosition->Y;
-        }
-        ret = m_CursorQueue.QueueCursor(vbuf);
-        DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
-        if (ret == 0)
-        {
+            // Already hidden, nothing to send.
             status = STATUS_SUCCESS;
         }
         else
         {
-            VioGpuDbgBreak();
+            PGPU_UPDATE_CURSOR crsr;
+            PGPU_VBUFFER vbuf;
+            UINT ret = 0;
+            crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
+            RtlZeroMemory(crsr, sizeof(*crsr));
+
+            if (!visible)
+            {
+                // Hide the sprite for real instead of parking it at (0, 0) with the resource still
+                // attached: a parked sprite stays visible in the top left corner of the display.
+                crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+                crsr->resource_id = 0;
+                m_bCursorHidden = TRUE;
+            }
+            else if (m_bCursorHidden)
+            {
+                // Coming back from a hide: MOVE_CURSOR does not re-associate a detached resource, so the
+                // sprite must be re-attached with a full UPDATE_CURSOR. The image itself is still
+                // uploaded, only the association has to be recreated.
+                crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+                crsr->resource_id = m_pCursorBuf->GetId();
+                crsr->pos.x = pSetPointerPosition->X;
+                crsr->pos.y = pSetPointerPosition->Y;
+                crsr->hot_x = m_CursorHotX;
+                crsr->hot_y = m_CursorHotY;
+                m_bCursorHidden = FALSE;
+            }
+            else
+            {
+                crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;
+                crsr->resource_id = m_pCursorBuf->GetId();
+                crsr->pos.x = pSetPointerPosition->X;
+                crsr->pos.y = pSetPointerPosition->Y;
+            }
+
+            ret = m_CursorQueue.QueueCursor(vbuf);
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
+            if (ret == 0)
+            {
+                status = STATUS_SUCCESS;
+            }
+            else
+            {
+                VioGpuDbgBreak();
+            }
         }
     }
     KeReleaseGuardedMutex(&m_CursorMutex);
