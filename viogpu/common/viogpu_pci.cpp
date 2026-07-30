@@ -24,7 +24,7 @@
  **********************************************************************/
 #include "viogpu.h"
 #include "..\viogpudo\viogpudo.h"
-#if !DBG
+#if !DBG && !VIOGPU_SERIAL_TRACE
 #include "viogpu_pci.tmh"
 #endif
 

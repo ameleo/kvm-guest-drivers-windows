@@ -16,15 +16,42 @@
 #define TRACE_LEVEL_RESERVED9   9
 #endif // TRACE_LEVEL_INFORMATION
 
+//
+// Route DbgPrint to COM1 (0x3F8) instead of WPP, in a Release build, without turning on DBG.
+//
+// WPP traces are collected by ETW inside the guest. That is unusable the moment the display path is what is
+// being debugged: no screen, no way to start the collector, no trace. The serial writer needs nothing in the
+// guest - run QEMU with `-serial file:viogpu-trace.log` and read it on the host.
+//
+// Turning DBG on would also have done this, but it arms NT_ASSERT everywhere, which turns a display bug into a
+// bugcheck. This toggle keeps Release semantics and only changes where the text goes.
+//
+// Set to 0 to go back to WPP.
+//
+#define VIOGPU_SERIAL_TRACE 1
+
 #if DBG
+//
+// CAREFUL: this branch is the one that is actually taken by the shipping build. "Win11 Release|x64" is the only
+// configuration in viogpudo.vcxproj with UseDebugLibraries=true, which defines DBG=1 - so the driver is built
+// with debug semantics (NT_ASSERT armed included) despite the configuration being named Release.
+//
+// VIOGPU_SERIAL_TRACE therefore has to steer THIS branch as well, otherwise it silently selects a code path that
+// is never compiled: PRINT_DEBUG routes DbgPrint to vDbgPrintEx, i.e. to a kernel debugger, and nothing ever
+// reaches the serial port no matter what the #else branch says.
+//
+#if VIOGPU_SERIAL_TRACE
+#define COM_DEBUG 1
+#else
 #define PRINT_DEBUG 1
-//#define COM_DEBUG 1
+#endif
 
     extern int nDebugLevel;
     extern int bBreakAlways;
 
     void DebugPrintFuncSerial(const char *format, ...);
     void DebugPrintFuncKdPrint(const char *format, ...);
+    void InitializeSerialPort(void);
 #define DbgExpandArguments(...) __VA_ARGS__
 #define DbgPrint(Level, MSG) \
     if (Level <= nDebugLevel) VirtioDebugPrintProc(DbgExpandArguments MSG);
@@ -33,6 +60,24 @@
 
 #define WPP_INIT_TRACING(driver, regpath)  InitializeDebugPrints(driver, regpath);
 #define WPP_CLEANUP(driver)
+#elif VIOGPU_SERIAL_TRACE
+
+extern int nDebugLevel;
+
+void DebugPrintFuncSerial(const char *format, ...);
+void InitializeSerialDebugPrints(void);
+
+#define DbgExpandArguments(...) __VA_ARGS__
+#define DbgPrint(Level, MSG) \
+    if ((Level) <= nDebugLevel) DebugPrintFuncSerial(DbgExpandArguments MSG);
+
+#define VioGpuDbgBreak() {}
+
+// No session to attach to, so tracing is live from the first line of DriverEntry - which is the point: the
+// interesting failures happen long before anything in the guest could start a collector.
+#define WPP_INIT_TRACING(driver, regpath) InitializeSerialDebugPrints()
+#define WPP_CLEANUP(driver)
+
 #else
 //#define DbgPrint(level, line) {};
 
