@@ -528,6 +528,71 @@ void CtrlQueue::CreateResource3D(UINT res_id, UINT format, UINT width, UINT heig
     QueueBuffer(vbuf);
 }
 
+//
+// Submit a command stream on a context ring and wait for it to complete.
+//
+// The waiting is the interesting part, and it needs no new machinery: a command carrying VIRTIO_GPU_FLAG_FENCE
+// gets no response until the fence signals, so the existing PrepareWait/WaitForCompletion pair -- which waits
+// on the response -- already is the fence wait. What the fence fields buy is WHICH timeline signals it.
+//
+BOOLEAN CtrlQueue::Submit3D(UINT ctx_id, UCHAR ring_idx, PVOID data, ULONG size, ULONG TimeoutMs)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s ctx=%u ring=%u size=%lu\n", __FUNCTION__, ctx_id, ring_idx, size));
+
+    PGPU_CMD_SUBMIT cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_SUBMIT)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    const ULONGLONG fenceId = (ULONGLONG)InterlockedIncrement(&m_FenceIdr);
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
+    cmd->hdr.fence_id = fenceId;
+    cmd->hdr.ring_idx = ring_idx;
+    cmd->size = size;
+
+    // The stream travels as data, not inline: same shape as ATTACH_BACKING's entries.
+    vbuf->data_buf = data;
+    vbuf->data_size = size;
+
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, TimeoutMs))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("---> SUBMIT_3D fence %I64u never signalled (ctx=%u ring=%u)\n", fenceId, ctx_id, ring_idx));
+        return FALSE;
+    }
+
+    BOOLEAN ok = FALSE;
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+    if (resp != NULL && resp->type == VIRTIO_GPU_RESP_OK_NODATA)
+    {
+        ok = TRUE;
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("---> SUBMIT_3D refused: resp=0x%X (ctx=%u ring=%u)\n", resp ? resp->type : 0, ctx_id, ring_idx));
+    }
+
+    ReleaseBuffer(vbuf);
+    return ok;
+}
+
 void CtrlQueue::CreateCtx(UINT ctx_id, UINT context_init, PCSTR name)
 {
     PAGED_CODE();

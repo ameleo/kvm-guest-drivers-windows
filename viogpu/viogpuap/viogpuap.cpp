@@ -142,6 +142,46 @@ static int VenusMapTest(void)
     return rc;
 }
 
+//
+// Fire the driver's submission check. Everything interesting is on the driver's trace: from here we only learn
+// whether the escape succeeded.
+//
+static int VenusSubmitTest(void)
+{
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open = {0};
+    wcscpy_s(open.DeviceName, L"\\\\.\\DISPLAY1");
+
+    NTSTATUS status = D3DKMTOpenAdapterFromGdiDisplayName(&open);
+    if (!NT_SUCCESS(status))
+    {
+        PrintMessage(L"OpenAdapter failed 0x%x\n", status);
+        return 1;
+    }
+
+    VIOGPU_ESCAPE data{0};
+    data.Type = VIOGPU_VENUS_SUBMIT;
+    data.DataLength = sizeof(VIOGPU_VENUS_MAPPING);
+
+    D3DKMT_ESCAPE escape = {0};
+    escape.hAdapter = open.hAdapter;
+    escape.pPrivateDriverData = &data;
+    escape.PrivateDriverDataSize = sizeof(data);
+
+    status = D3DKMTEscape(&escape);
+    if (NT_SUCCESS(status))
+    {
+        PrintMessage(L"submit escape returned OK; see the driver trace for the per-ring fence timings\n");
+    }
+    else
+    {
+        PrintMessage(L"VENUS_SUBMIT escape failed 0x%x\n", status);
+    }
+
+    D3DKMT_CLOSEADAPTER close = {open.hAdapter};
+    D3DKMTCloseAdapter(&close);
+    return NT_SUCCESS(status) ? 0 : 1;
+}
+
 int _cdecl wmain(__in ULONG argc, __in_ecount(argc) PWCHAR argv[])
 {
     PrintMessage(L"viogpuap.exe built on %ws %ws\n", _CRT_WIDE(__DATE__), _CRT_WIDE(__TIME__));
@@ -149,6 +189,11 @@ int _cdecl wmain(__in ULONG argc, __in_ecount(argc) PWCHAR argv[])
     if (argc == 2 && _wcsicmp(argv[1], L"venustest") == 0)
     {
         return VenusMapTest();
+    }
+
+    if (argc == 2 && _wcsicmp(argv[1], L"venussubmit") == 0)
+    {
+        return VenusSubmitTest();
     }
 
     PipeClient *pClient = NULL;

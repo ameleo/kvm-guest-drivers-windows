@@ -38,8 +38,9 @@
 // the host memory window can be reached and that both sides see the same bytes. Numbered well clear of the
 // display escapes above so the two can never be confused.
 //
-#define VIOGPU_VENUS_MAP   0x10
-#define VIOGPU_VENUS_UNMAP 0x11
+#define VIOGPU_VENUS_MAP    0x10
+#define VIOGPU_VENUS_UNMAP  0x11
+#define VIOGPU_VENUS_SUBMIT 0x12
 
 #pragma pack(1)
 typedef struct _VIOGPU_VENUS_MAPPING

@@ -103,6 +103,7 @@ class VioGpuAdapter : IVioGpuPCI
     VOID RecordHostVisibleWindow(void);
     NTSTATUS VenusMapForUser(PVIOGPU_VENUS_MAPPING pOut);
     NTSTATUS VenusUnmapForUser(void);
+    NTSTATUS VenusSubmitTest(void);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);

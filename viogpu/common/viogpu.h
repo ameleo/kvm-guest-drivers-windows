@@ -122,7 +122,13 @@ typedef struct virtio_gpu_rect
 } GPU_RECT, *PGPU_RECT;
 #pragma pack()
 
-#define VIRTIO_GPU_FLAG_FENCE (1 << 0)
+//
+// FENCE makes the device withhold the response until the work is done, so waiting for the response IS waiting
+// for the fence. INFO_RING_IDX says the ring_idx field below is meaningful -- without it the fence lands on the
+// context's global timeline instead of the per-ring one.
+//
+#define VIRTIO_GPU_FLAG_FENCE         (1 << 0)
+#define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
 
 #pragma pack(1)
 typedef struct virtio_gpu_ctrl_hdr
@@ -131,9 +137,15 @@ typedef struct virtio_gpu_ctrl_hdr
     ULONG flags;
     ULONGLONG fence_id;
     ULONG ctx_id;
-    ULONG padding;
+    // Was a ULONG padding here. Same width, but a fence cannot name a timeline without it: ring 0 is the
+    // context's CPU timeline, signalled as soon as the command is processed; the others map to VkQueues.
+    UCHAR ring_idx;
+    UCHAR padding[3];
 } GPU_CTRL_HDR, *PGPU_CTRL_HDR;
 #pragma pack()
+
+// Implied by the CONTEXT_INIT uapi, and what Mesa asks for at context creation.
+#define VIRTIO_GPU_MAX_RINGS 64
 
 #pragma pack(1)
 typedef struct virtio_gpu_display_one
@@ -356,6 +368,16 @@ typedef struct virtio_gpu_resp_capset_info
     ULONG capset_max_size;
     ULONG padding;
 } GPU_RESP_CAPSET_INFO, *PGPU_RESP_CAPSET_INFO;
+#pragma pack()
+
+/* VIRTIO_GPU_CMD_SUBMIT_3D: the command stream itself follows as data, like ATTACH_BACKING's entries */
+#pragma pack(1)
+typedef struct virtio_gpu_cmd_submit
+{
+    GPU_CTRL_HDR hdr;
+    ULONG size;
+    ULONG padding;
+} GPU_CMD_SUBMIT, *PGPU_CMD_SUBMIT;
 #pragma pack()
 
 /* VIRTIO_GPU_CMD_RESOURCE_CREATE_3D */

@@ -3042,6 +3042,60 @@ cleanup:
 }
 
 //
+// Prove the submission plumbing -- fence deferral and ring_idx -- WITHOUT touching Venus.
+//
+// An earlier version of this submitted an empty stream to a Venus context, on the reasoning that zero bytes is
+// the safest possible payload. That was wrong, and it killed the host: zero bytes is safe for a buffer, not for
+// a PROTOCOL PARSER. Venus expects a valid vn_cs stream, an empty one is malformed rather than neutral, and
+// Venus answers protocol violations by tearing the context down.
+//
+// So submit on a virgl context instead, where an empty stream really is a no-op: the decoder walks dwords and
+// simply has none to walk. The fence machinery is capset-independent, which is exactly what makes this a valid
+// substitute. Venus submission stays untested until Mesa can produce a real stream -- there is no honest way to
+// forge one here.
+//
+// Ring 0 only, for the same reason: it is the context's CPU timeline and always exists. Higher rings are
+// created through the Venus protocol by the guest driver, so testing ring 1 would be testing a ring nobody
+// created.
+//
+NTSTATUS VioGpuAdapter::VenusSubmitTest(void)
+{
+    PAGED_CODE();
+
+    if (!m_bHostVirgl)
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    const UINT ctxId = 3;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    m_CtrlQueue.CreateCtx(ctxId, VIRTIO_GPU_CAPSET_VIRGL2, "viogpu-fence-test");
+
+    LARGE_INTEGER before, after, freq;
+    before = KeQueryPerformanceCounter(&freq);
+
+    const BOOLEAN ok = m_CtrlQueue.Submit3D(ctxId, 0, NULL, 0, 2000);
+
+    after = KeQueryPerformanceCounter(NULL);
+    const LONGLONG us = freq.QuadPart ? ((after.QuadPart - before.QuadPart) * 1000000) / freq.QuadPart : 0;
+
+    if (ok)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s FENCE OK: ctx=%u ring=0 (virgl2) fence returned in %I64d us\n", __FUNCTION__, ctxId, us));
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s FENCE FAILED\n", __FUNCTION__));
+        status = STATUS_UNSUCCESSFUL;
+    }
+
+    m_CtrlQueue.DestroyCtx(ctxId);
+    return status;
+}
+
+//
 // Tear the session down, and on the way out check what user mode left behind. Reading it through the KERNEL
 // mapping is the point: it proves the two mappings are the same memory, which writing alone would not.
 //
@@ -4260,6 +4314,23 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
         case VIOGPU_VENUS_UNMAP:
             {
                 status = VenusUnmapForUser();
+                break;
+            }
+        case VIOGPU_VENUS_SUBMIT:
+            {
+                //
+                // Disabled, and not because the test was wrong twice.
+                //
+                // Any SUBMIT_3D on this host makes a LATER scanout lose its texture: QEMU dies on
+                // dbus_scanout_texture's assert(tex_id), which is the scanout path, not the submit path. The
+                // submit itself is never reported as failing. It happened with a Venus context and again with a
+                // virgl2 one, so it is not about the capset or the payload.
+                //
+                // That is a real interaction, not a test artefact: Mesa will create contexts and submit on them,
+                // and whatever our scanout resource loses when it happens has to be understood first. Leaving a
+                // switch that reliably kills the host would only invite someone to pull it.
+                //
+                status = STATUS_NOT_SUPPORTED;
                 break;
             }
         case VIOGPU_GET_CUSTOM_RESOLUTION:
