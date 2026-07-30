@@ -354,6 +354,25 @@ typedef struct virtio_gpu_resp_capset_info
 } GPU_RESP_CAPSET_INFO, *PGPU_RESP_CAPSET_INFO;
 #pragma pack()
 
+/* VIRTIO_GPU_CMD_GET_CAPSET */
+#pragma pack(1)
+typedef struct virtio_gpu_cmd_get_capset
+{
+    GPU_CTRL_HDR hdr;
+    ULONG capset_id;
+    ULONG capset_version;
+} GPU_CMD_GET_CAPSET, *PGPU_CMD_GET_CAPSET;
+#pragma pack()
+
+/* VIRTIO_GPU_RESP_OK_CAPSET */
+#pragma pack(1)
+typedef struct virtio_gpu_resp_capset
+{
+    GPU_CTRL_HDR hdr;
+    UCHAR capset_data[1]; // really capset_max_size bytes, allocated by the caller
+} GPU_RESP_CAPSET, *PGPU_RESP_CAPSET;
+#pragma pack()
+
 //
 // Capset ids are indices into a per-host table, NOT a bitmask: the host reports how many entries it has
 // (num_capsets) and each one must be queried by index to learn its id. Valid ids run from 1 to 63.

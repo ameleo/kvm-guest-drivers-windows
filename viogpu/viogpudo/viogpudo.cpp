@@ -2824,6 +2824,66 @@ VOID VioGpuAdapter::RecordHostCapabilities(void)
     ZwClose(hKey);
 }
 
+VOID VioGpuAdapter::DumpVenusCapset(ULONG version, ULONG size)
+{
+    PAGED_CODE();
+
+    PGPU_VBUFFER vbuf = NULL;
+
+    if (!m_CtrlQueue.AskCapset(&vbuf, VIRTIO_GPU_CAPSET_VENUS, version, size) || vbuf == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s no Venus capset payload\n", __FUNCTION__));
+        return;
+    }
+
+    PGPU_RESP_CAPSET resp = (PGPU_RESP_CAPSET)vbuf->resp_buf;
+    if (resp == NULL || resp->hdr.type != VIRTIO_GPU_RESP_OK_CAPSET)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING,
+                 ("%s Venus capset payload refused (type=0x%X)\n", __FUNCTION__, resp ? resp->hdr.type : 0));
+        m_CtrlQueue.ReleaseBuffer(vbuf);
+        return;
+    }
+
+    //
+    // Dump raw first, decode second. The field names below follow virgl_renderer_capset_venus, but that layout
+    // is a host-side struct we do not compile against: if it ever shifts, the hex is what stays trustworthy.
+    //
+    const PUCHAR data = resp->capset_data;
+
+    for (ULONG off = 0; off < size; off += 16)
+    {
+        const ULONG n = min(16, size - off);
+        CHAR line[16 * 3 + 1];
+
+        for (ULONG j = 0; j < n; j++)
+        {
+            const CHAR digits[] = "0123456789abcdef";
+            line[j * 3 + 0] = digits[data[off + j] >> 4];
+            line[j * 3 + 1] = digits[data[off + j] & 0xF];
+            line[j * 3 + 2] = ' ';
+        }
+        line[n * 3] = '\0';
+
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s venus caps +%02lx: %s\n", __FUNCTION__, off, line));
+    }
+
+    if (size >= 4 * sizeof(ULONG))
+    {
+        const ULONG *w = (const ULONG *)data;
+
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s venus wire_format=%lu vk_xml=%lu cmd_serialization=%lu protocol=%lu\n",
+                  __FUNCTION__,
+                  w[0],
+                  w[1],
+                  w[2],
+                  w[3]));
+    }
+
+    m_CtrlQueue.ReleaseBuffer(vbuf);
+}
+
 VOID VioGpuAdapter::RecordHostCapsets(void)
 {
     PAGED_CODE();
@@ -2835,6 +2895,8 @@ VOID VioGpuAdapter::RecordHostCapsets(void)
     // so its absence here is the difference between "3D" and "the 3D we want".
     //
     ULONGLONG mask = 0;
+    ULONG venusVersion = 0;
+    ULONG venusSize = 0;
 
     for (ULONG i = 0; i < m_u32NumCapsets; i++)
     {
@@ -2860,6 +2922,12 @@ VOID VioGpuAdapter::RecordHostCapsets(void)
                       resp->capset_id,
                       resp->capset_max_version,
                       resp->capset_max_size));
+
+            if (resp->capset_id == VIRTIO_GPU_CAPSET_VENUS)
+            {
+                venusVersion = resp->capset_max_version;
+                venusSize = resp->capset_max_size;
+            }
         }
         else
         {
@@ -2872,6 +2940,11 @@ VOID VioGpuAdapter::RecordHostCapsets(void)
         }
 
         m_CtrlQueue.ReleaseBuffer(vbuf);
+    }
+
+    if (venusSize != 0)
+    {
+        DumpVenusCapset(venusVersion, venusSize);
     }
 
     const ULONG virgl = (mask & (1ull << VIRTIO_GPU_CAPSET_VIRGL)) ? 1 : 0;

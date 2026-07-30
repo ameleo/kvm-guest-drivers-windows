@@ -436,6 +436,68 @@ BOOLEAN CtrlQueue::AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx)
     return TRUE;
 }
 
+//
+// Fetch the capset PAYLOAD. Unlike the *_INFO query this returns the protocol's own version structure -- for
+// Venus, the wire-format handshake a guest Mesa checks before it will talk at all. Reading it here means a
+// host/guest mismatch shows up as data rather than as an unexplained failure much later.
+//
+BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_version, ULONG capset_size)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s id = %lu\n", __FUNCTION__, capset_id));
+
+    PGPU_CMD_GET_CAPSET cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_CAPSET resp_buf;
+    SIZE_T resp_size = sizeof(GPU_RESP_CAPSET) + capset_size;
+
+    if (buf)
+    {
+        *buf = NULL;
+    }
+
+    resp_buf = reinterpret_cast<PGPU_RESP_CAPSET>(new (NonPagedPoolNx) BYTE[resp_size]);
+
+    if (!resp_buf)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %Iu bytes\n", __FUNCTION__, resp_size));
+        return FALSE;
+    }
+    RtlZeroMemory(resp_buf, resp_size);
+
+    cmd = (PGPU_CMD_GET_CAPSET)AllocCmdResp(&vbuf, sizeof(GPU_CMD_GET_CAPSET), resp_buf, (int)resp_size);
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_CAPSET));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    cmd->capset_id = capset_id;
+    cmd->capset_version = capset_version;
+
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
+    {
+        ReleaseBuffer(vbuf); // frees resp_buf too (resp_size > MAX_INLINE_RESP_SIZE)
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        // Survivable: the caller just skips this capset. The buffer belongs to the wait machinery from here.
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to ask capset id = %lu\n", capset_id));
+        return FALSE;
+    }
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
 void CtrlQueue::CreateResource(UINT res_id, UINT format, UINT width, UINT height)
 {
     PAGED_CODE();

@@ -98,6 +98,7 @@ class VioGpuAdapter : IVioGpuPCI
     //
     VOID RecordHostCapabilities(void);
     VOID RecordHostCapsets(void);
+    VOID DumpVenusCapset(ULONG version, ULONG size);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);

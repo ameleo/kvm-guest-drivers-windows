@@ -266,6 +266,7 @@ class CtrlQueue : public VioGpuQueue
     BOOLEAN AskEdidInfo(PGPU_VBUFFER *buf, UINT id);
     BOOLEAN GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid);
     BOOLEAN AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx);
+    BOOLEAN AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_version, ULONG capset_size);
 
   private:
     volatile LONG m_FenceIdr;
