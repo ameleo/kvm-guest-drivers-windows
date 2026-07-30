@@ -31,6 +31,7 @@
 
 #include "viogpu.h"
 #include "viogpu_queue.h"
+#include "viogpum.h"   // shared escape ABI (VIOGPU_VENUS_MAPPING)
 
 // FALLBACK simulated-vblank rate (Hz), used when the host EDID has no usable detailed timing. The actual rate
 // comes from the host EDID (VioGpuAdapter::GetEdidRefreshHz) so the host controls it, like for a Linux guest.
@@ -100,8 +101,8 @@ class VioGpuAdapter : IVioGpuPCI
     VOID RecordHostCapsets(void);
     VOID DumpVenusCapset(ULONG version, ULONG size);
     VOID RecordHostVisibleWindow(void);
-    VOID ProbeVenusMemoryPath(void);
-    VOID TouchHostVisibleWindow(ULONG mapInfo, ULONGLONG size);
+    NTSTATUS VenusMapForUser(PVIOGPU_VENUS_MAPPING pOut);
+    NTSTATUS VenusUnmapForUser(void);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);
@@ -233,11 +234,23 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN m_bBlobSupported;   // VIRTIO_GPU_F_RESOURCE_BLOB negotiated -> blob scanout path (else classic 2D)
     UINT32 m_u32NumCapsets;
     BOOLEAN m_bVenusEligible;   // set by RecordHostCapsets; gates the Venus memory dry run
+    BOOLEAN m_bHostVirgl;      // host offers VIRGL: no MEM_GUEST blob scanout, and CREATE_3D for orientation
     // Host-visible window, as discovered from the PCI capability (never assumed: the BAR index and offset
     // are per-host). m_HostVisibleLen == 0 means no window was advertised.
     ULONG m_HostVisibleBar;
     ULONGLONG m_HostVisibleOffset;
     ULONGLONG m_HostVisibleLen;
+    // Single Venus bring-up mapping session (not a resource manager: one at a time, by design).
+    UINT m_VenusTestCtxId;
+    UINT m_VenusTestResId;
+    PMDL m_VenusTestMdl;
+    PVOID m_VenusTestKernelVa;
+    PVOID m_VenusTestUserVa;
+    ULONGLONG m_VenusTestSize;
+    // Venus resources live in their own id range, well above anything m_Idr hands out for scanouts. Recycling
+    // an id between a host blob and a 2D scanout resource is how a stale host resource turns into a scanout
+    // with no texture -- which QEMU meets with an assertion, not an error.
+    UINT m_VenusNextResId;
     UINT32 m_u32NumScanouts;
     CtrlQueue m_CtrlQueue;
     CrsrQueue m_CursorQueue;

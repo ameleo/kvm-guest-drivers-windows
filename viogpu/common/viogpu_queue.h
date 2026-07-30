@@ -270,6 +270,7 @@ class CtrlQueue : public VioGpuQueue
 
     // 3D context and host-visible blob plumbing (Venus transport). Unlike the scanout blob path these carry a
     // ctx_id in the header and no guest pages: the memory lives on the host.
+    void CreateResource3D(UINT res_id, UINT format, UINT width, UINT height, UINT flags);
     void CreateCtx(UINT ctx_id, UINT context_init, PCSTR name);
     void DestroyCtx(UINT ctx_id);
     void CreateBlobHost(UINT ctx_id, UINT res_id, UINT blob_mem, UINT blob_flags, ULONGLONG blob_id, ULONGLONG size);

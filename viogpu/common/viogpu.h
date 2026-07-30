@@ -358,6 +358,30 @@ typedef struct virtio_gpu_resp_capset_info
 } GPU_RESP_CAPSET_INFO, *PGPU_RESP_CAPSET_INFO;
 #pragma pack()
 
+/* VIRTIO_GPU_CMD_RESOURCE_CREATE_3D */
+#pragma pack(1)
+typedef struct virtio_gpu_resource_create_3d
+{
+    GPU_CTRL_HDR hdr;
+    ULONG resource_id;
+    ULONG target;
+    ULONG format;
+    ULONG bind;
+    ULONG width;
+    ULONG height;
+    ULONG depth;
+    ULONG array_size;
+    ULONG last_level;
+    ULONG nr_samples;
+    ULONG flags; // unlike CREATE_2D, where QEMU forces Y_0_TOP, these come from the guest
+    ULONG padding;
+} GPU_RES_CREATE_3D, *PGPU_RES_CREATE_3D;
+#pragma pack()
+
+#define VIRGL_TARGET_TEXTURE_2D  2
+#define VIRGL_BIND_RENDER_TARGET (1 << 1)
+#define VIRGL_RESOURCE_Y_0_TOP   (1 << 0)
+
 /* VIRTIO_GPU_CMD_CTX_CREATE */
 #pragma pack(1)
 typedef struct virtio_gpu_ctx_create

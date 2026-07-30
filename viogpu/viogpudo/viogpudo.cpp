@@ -2553,9 +2553,17 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_u64GuestFeatures = 0;
     m_u32NumCapsets = 0;
     m_bVenusEligible = FALSE;
+    m_bHostVirgl = FALSE;
+    m_VenusNextResId = 0x40000000;
     m_HostVisibleBar = 0;
     m_HostVisibleOffset = 0;
     m_HostVisibleLen = 0;
+    m_VenusTestCtxId = 0;
+    m_VenusTestResId = 0;
+    m_VenusTestMdl = NULL;
+    m_VenusTestKernelVa = NULL;
+    m_VenusTestUserVa = NULL;
+    m_VenusTestSize = 0;
     m_u32NumScanouts = 0;
 
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
@@ -2648,10 +2656,34 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit(DXGK_DISPLAY_INFORMATION *pDispInfo)
 
         AckFeature(VIRTIO_F_ACCESS_PLATFORM);
 
+        //
         // Blob scanout: negotiate only if the host offers it. When absent, m_bBlobSupported stays FALSE and the
         // driver falls back to the classic 2D path (CREATE_2D + ATTACH_BACKING + per-frame TRANSFER_TO_HOST).
-        m_bBlobSupported = AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
-        DbgPrint(TRACE_LEVEL_FATAL, ("%s blob scanout %s\n", __FUNCTION__, m_bBlobSupported ? "ENABLED" : "disabled"));
+        //
+        // A virgl host is the exception, and it has to be refused. On a `-gl` device every command goes through
+        // virtio_gpu_virgl_process_cmd, where SET_SCANOUT_BLOB has its own implementation expecting a resource
+        // backed by virglrenderer -- not the flat guest RAM our MEM_GUEST blobs carry. It answers 0x1200 on
+        // every present, so the screen never comes up. Negotiating the feature and then failing every frame is
+        // strictly worse than not negotiating it: the 2D path costs a per-frame transfer but it WORKS, and a
+        // machine that can do 3D must not be a machine that cannot display.
+        //
+        // This is not the end state. The target is a HOST3D blob backed by a host dmabuf, which is what Venus
+        // allocates anyway -- at which point the zero-copy scanout comes back, on the host side of the wire.
+        //
+        const BOOLEAN hostIsVirgl = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_VIRGL) ? TRUE : FALSE;
+
+        m_bHostVirgl = hostIsVirgl;
+        m_bBlobSupported = FALSE;
+        if (!hostIsVirgl)
+        {
+            m_bBlobSupported = AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
+        }
+
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s blob scanout %s%s\n",
+                  __FUNCTION__,
+                  m_bBlobSupported ? "ENABLED" : "disabled",
+                  hostIsVirgl ? " (virgl host: MEM_GUEST scanout unsupported, using the 2D path)" : ""));
 
         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
         if (!NT_SUCCESS(status))
@@ -2847,177 +2879,244 @@ VOID VioGpuAdapter::RecordHostCapabilities(void)
 // Called only after RESOURCE_MAP_BLOB succeeded: before that the host has placed nothing at this offset and
 // the contents are undefined.
 //
-VOID VioGpuAdapter::TouchHostVisibleWindow(ULONG mapInfo, ULONGLONG size)
+// Hand a slice of the host memory window to the calling process.
+//
+// This is the one operation in the Venus contract with no Linux counterpart to copy: there mmap does it. Here
+// the range is device physical memory, so the MDL has to be built by hand from the page frame numbers -- the
+// usual helpers (MmBuildMdlForNonPagedPool and friends) describe pool, not a BAR.
+//
+// Everything that can throw is contained: MmMapLockedPagesSpecifyCache raises on failure for user-mode
+// mappings rather than returning NULL, and a raised exception here would be a bugcheck in an escape.
+//
+NTSTATUS VioGpuAdapter::VenusMapForUser(PVIOGPU_VENUS_MAPPING pOut)
 {
     PAGED_CODE();
 
-    if (m_HostVisibleLen == 0)
+    if (!m_bVenusEligible || m_HostVisibleLen == 0)
     {
-        return;
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (m_VenusTestUserVa != NULL)
+    {
+        // One session at a time: this is a bring-up path, not a resource manager.
+        return STATUS_DEVICE_BUSY;
     }
 
     CPciBar *pBar = m_PciResources.GetPciBar(m_HostVisibleBar);
     if (pBar == NULL || pBar->GetSize() == 0)
     {
-        //
-        // Worth logging loudly rather than skipping quietly: the capability names this BAR, so if PnP did not
-        // hand it to us the window is unreachable no matter what the host advertises. Windows describes BARs of
-        // 4 GB and over with CmResourceTypeMemoryLarge, which our resource walk does not decode.
-        //
-        DbgPrint(TRACE_LEVEL_FATAL,
-                 ("%s BAR %lu absent from the resource list -- window unreachable\n", __FUNCTION__,
-                  m_HostVisibleBar));
-        return;
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
-    // The blob sits at offset 0 of the window, and the window starts at the capability's offset inside the BAR.
+    const ULONGLONG size = VIOGPU_VENUS_TEST_SIZE;
+    const UINT ctxId = 2;
+
+    // Own id range, never m_Idr: a Venus resource and a scanout resource must never share an id, even after
+    // one of them has been destroyed.
+    const UINT resId = m_VenusNextResId++;
+
+    m_CtrlQueue.CreateCtx(ctxId, VIRTIO_GPU_CAPSET_VENUS, "viogpu-venus-map");
+    m_CtrlQueue.CreateBlobHost(ctxId, resId, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, 0, size);
+
+    ULONG mapInfo = 0;
+    if (!m_CtrlQueue.MapBlob(ctxId, resId, 0, &mapInfo))
+    {
+        m_CtrlQueue.DestroyResource(resId);
+        m_CtrlQueue.DestroyCtx(ctxId);
+        return STATUS_UNSUCCESSFUL;
+    }
+
     PHYSICAL_ADDRESS pa = pBar->GetPA();
     pa.QuadPart += m_HostVisibleOffset;
 
-    DbgPrint(TRACE_LEVEL_FATAL,
-             ("%s window BAR %lu bar_pa=0x%I64x + 0x%I64x -> pa=0x%I64x (bar size 0x%x)\n",
-              __FUNCTION__,
-              m_HostVisibleBar,
-              pBar->GetPA().QuadPart,
-              m_HostVisibleOffset,
-              pa.QuadPart,
-              pBar->GetSize()));
-
-    // Honour what the host answered rather than assuming. PAGE_READWRITE alone means cached.
+    MEMORY_CACHING_TYPE cacheType = MmCached;
     ULONG protect = PAGE_READWRITE;
-    PCSTR how = "cached";
-
     if (mapInfo == VIRTIO_GPU_MAP_CACHE_WC)
     {
+        cacheType = MmWriteCombined;
         protect = PAGE_READWRITE | PAGE_WRITECOMBINE;
-        how = "write-combined";
     }
     else if (mapInfo == VIRTIO_GPU_MAP_CACHE_UNCACHED)
     {
+        cacheType = MmNonCached;
         protect = PAGE_READWRITE | PAGE_NOCACHE;
-        how = "uncached";
     }
 
-    PVOID va = MmMapIoSpaceEx(pa, (SIZE_T)size, protect);
-    if (va == NULL)
+    NTSTATUS status = STATUS_SUCCESS;
+    PVOID kva = MmMapIoSpaceEx(pa, (SIZE_T)size, protect);
+    PMDL mdl = NULL;
+    PVOID uva = NULL;
+
+    if (kva == NULL)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("%s MmMapIoSpaceEx REFUSED a %s mapping of 0x%I64x bytes\n", __FUNCTION__,
-                                     how, size));
-        return;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto cleanup;
     }
 
-    //
-    // Write a pattern and read it back. This is what separates "the mapping call succeeded" from "the window is
-    // real memory that holds what we put in it".
-    //
-    volatile ULONG *p = (volatile ULONG *)va;
-    const ULONG count = 16;
-    BOOLEAN ok = TRUE;
-
-    for (ULONG i = 0; i < count; i++)
+    mdl = IoAllocateMdl(kva, (ULONG)size, FALSE, FALSE, NULL);
+    if (mdl == NULL)
     {
-        p[i] = 0xA5A50000u | i;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto cleanup;
     }
 
-    KeMemoryBarrier();
-
-    for (ULONG i = 0; i < count; i++)
     {
-        const ULONG got = p[i];
-        if (got != (0xA5A50000u | i))
+        // Describe the BAR pages ourselves; they are device memory, permanently present and never paged.
+        PPFN_NUMBER pfn = MmGetMdlPfnArray(mdl);
+        const ULONG pages = (ULONG)(size >> PAGE_SHIFT);
+        for (ULONG i = 0; i < pages; i++)
         {
-            DbgPrint(TRACE_LEVEL_FATAL,
-                     ("%s window readback MISMATCH at %lu: wrote 0x%08X read 0x%08X\n",
-                      __FUNCTION__,
-                      i,
-                      0xA5A50000u | i,
-                      got));
-            ok = FALSE;
-            break;
+            pfn[i] = (PFN_NUMBER)((pa.QuadPart >> PAGE_SHIFT) + i);
         }
+        mdl->MdlFlags |= MDL_PAGES_LOCKED;
     }
 
-    if (ok)
+    // Seed a pattern before the caller ever sees the memory, so user mode can prove it reads what we wrote.
+    {
+        volatile ULONG *p = (volatile ULONG *)kva;
+        const ULONG dwords = (ULONG)(size / sizeof(ULONG));
+        for (ULONG i = 0; i < dwords; i++)
+        {
+            p[i] = 0xC0DE0000u | (i & 0xFFFF);
+        }
+        KeMemoryBarrier();
+    }
+
+    __try
+    {
+        uva = MmMapLockedPagesSpecifyCache(mdl, UserMode, cacheType, NULL, FALSE, NormalPagePriority);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
         DbgPrint(TRACE_LEVEL_FATAL,
-                 ("%s WINDOW MAPPING OK: %s, wrote and read back %lu dwords at va=%p\n",
-                  __FUNCTION__,
-                  how,
-                  count,
-                  va));
+                 ("%s MmMapLockedPagesSpecifyCache raised 0x%X\n", __FUNCTION__, GetExceptionCode()));
+        uva = NULL;
     }
 
-    MmUnmapIoSpace(va, (SIZE_T)size);
+    if (uva == NULL)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto cleanup;
+    }
+
+    m_VenusTestCtxId = ctxId;
+    m_VenusTestResId = resId;
+    m_VenusTestMdl = mdl;
+    m_VenusTestKernelVa = kva;
+    m_VenusTestUserVa = uva;
+    m_VenusTestSize = size;
+
+    pOut->UserAddress = (ULONGLONG)(ULONG_PTR)uva;
+    pOut->Size = size;
+    pOut->ResourceId = resId;
+    pOut->MapInfo = mapInfo;
+    pOut->Pattern = 0xC0DE0000u;
+    pOut->Reserved = 0;
+
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s USER MAPPING OK: res=%u size=0x%I64x uva=0x%p kva=0x%p map_info=%lu\n",
+              __FUNCTION__,
+              resId,
+              size,
+              uva,
+              kva,
+              mapInfo));
+
+    return STATUS_SUCCESS;
+
+cleanup:
+    if (mdl != NULL)
+    {
+        IoFreeMdl(mdl);
+    }
+    if (kva != NULL)
+    {
+        MmUnmapIoSpace(kva, (SIZE_T)size);
+    }
+    m_CtrlQueue.UnmapBlob(ctxId, resId);
+    m_CtrlQueue.DestroyResource(resId);
+    m_CtrlQueue.DestroyCtx(ctxId);
+
+    DbgPrint(TRACE_LEVEL_FATAL, ("%s FAILED status=0x%X\n", __FUNCTION__, status));
+    return status;
 }
 
-VOID VioGpuAdapter::ProbeVenusMemoryPath(void)
+//
+// Tear the session down, and on the way out check what user mode left behind. Reading it through the KERNEL
+// mapping is the point: it proves the two mappings are the same memory, which writing alone would not.
+//
+NTSTATUS VioGpuAdapter::VenusUnmapForUser(void)
 {
     PAGED_CODE();
 
-    // Ids reserved for this probe alone. The context is destroyed before anything else uses the device, and
-    // the resource id comes from the same generator as the rest so it can never collide with a scanout blob.
-    const UINT ctxId = 1;
-    const ULONGLONG size = 0x10000; // 64 KB is plenty to prove the path
-    UINT resId = (UINT)m_Idr.GetId();
-
-    if (resId == 0)
+    if (m_VenusTestUserVa == NULL)
     {
-        DbgPrint(TRACE_LEVEL_WARNING, ("%s no resource id available\n", __FUNCTION__));
-        return;
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
-    m_CtrlQueue.CreateCtx(ctxId, VIRTIO_GPU_CAPSET_VENUS, "viogpu-probe");
-
-    // blob_id 0 with HOST3D + MAPPABLE is the "allocate host shmem" convention, gated by the capset's
-    // supports_blob_id_0 flag that this host advertises.
-    m_CtrlQueue.CreateBlobHost(ctxId,
-                               resId,
-                               VIRTIO_GPU_BLOB_MEM_HOST3D,
-                               VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-                               0,
-                               size);
-
-    ULONG mapInfo = 0;
-    if (m_CtrlQueue.MapBlob(ctxId, resId, 0, &mapInfo))
     {
-        PCSTR cache = "unknown";
-        switch (mapInfo)
+        volatile ULONG *p = (volatile ULONG *)m_VenusTestKernelVa;
+        const ULONG dwords = (ULONG)(m_VenusTestSize / sizeof(ULONG));
+        ULONG mismatches = 0;
+        ULONG firstBad = 0;
+        ULONG firstGot = 0;
+
+        for (ULONG i = 0; i < dwords; i++)
         {
-            case VIRTIO_GPU_MAP_CACHE_CACHED:
-                cache = "cached";
-                break;
-            case VIRTIO_GPU_MAP_CACHE_UNCACHED:
-                cache = "uncached";
-                break;
-            case VIRTIO_GPU_MAP_CACHE_WC:
-                cache = "write-combined";
-                break;
-            default:
-                break;
+            const ULONG want = (0xC0DE0000u | (i & 0xFFFF)) ^ VIOGPU_VENUS_XOR;
+            const ULONG got = p[i];
+            if (got != want)
+            {
+                if (mismatches == 0)
+                {
+                    firstBad = i;
+                    firstGot = got;
+                }
+                mismatches++;
+            }
         }
 
-        DbgPrint(TRACE_LEVEL_FATAL,
-                 ("%s VENUS MEMORY PATH OK: ctx=%u res=%u size=0x%I64x mapped at window offset 0 map_info=%lu "
-                  "(%s)\n",
-                  __FUNCTION__,
-                  ctxId,
-                  resId,
-                  size,
-                  mapInfo,
-                  cache));
-
-        TouchHostVisibleWindow(mapInfo, size);
-
-        m_CtrlQueue.UnmapBlob(ctxId, resId);
+        if (mismatches == 0)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s ROUND TRIP OK: all %lu dwords written by user mode are visible in the kernel mapping\n",
+                      __FUNCTION__,
+                      dwords));
+        }
+        else
+        {
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s ROUND TRIP MISMATCH: %lu/%lu dwords, first at %lu read 0x%08X\n",
+                      __FUNCTION__,
+                      mismatches,
+                      dwords,
+                      firstBad,
+                      firstGot));
+        }
     }
-    else
+
+    __try
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("%s venus memory path FAILED at MAP_BLOB\n", __FUNCTION__));
+        MmUnmapLockedPages(m_VenusTestUserVa, m_VenusTestMdl);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s MmUnmapLockedPages raised 0x%X\n", __FUNCTION__, GetExceptionCode()));
     }
 
-    m_CtrlQueue.DestroyResource(resId);
-    m_CtrlQueue.DestroyCtx(ctxId);
-    m_Idr.PutId(resId);
+    IoFreeMdl(m_VenusTestMdl);
+    MmUnmapIoSpace(m_VenusTestKernelVa, (SIZE_T)m_VenusTestSize);
+
+    m_CtrlQueue.UnmapBlob(m_VenusTestCtxId, m_VenusTestResId);
+    m_CtrlQueue.DestroyResource(m_VenusTestResId);
+    m_CtrlQueue.DestroyCtx(m_VenusTestCtxId);
+
+    m_VenusTestUserVa = NULL;
+    m_VenusTestKernelVa = NULL;
+    m_VenusTestMdl = NULL;
+    m_VenusTestSize = 0;
+
+    return STATUS_SUCCESS;
 }
 
 //
@@ -3522,11 +3621,12 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     RecordHostCapsets();
     RecordHostVisibleWindow();
 
-    // Only on a host that could actually carry Venus. Elsewhere this must not emit a single command.
-    if (m_bVenusEligible)
-    {
-        ProbeVenusMemoryPath();
-    }
+    //
+    // The boot-time Venus dry run lived here and has served its purpose: the memory path is proven and
+    // recorded. It is gone rather than kept, because it ran a host context and a blob to completion just
+    // before the framebuffer was built -- risk on the display path, for information already gathered. The
+    // VIOGPU_VENUS_MAP escape covers the same ground on demand, after boot.
+    //
 
     status = BuildModeList(pDispInfo);
     if (!NT_SUCCESS(status))
@@ -4146,6 +4246,20 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_BUFFER_SIZE;
                 }
                 pVioGpuEscape->Id = m_Id;
+                break;
+            }
+        case VIOGPU_VENUS_MAP:
+            {
+                if (pVioGpuEscape->DataLength < sizeof(VIOGPU_VENUS_MAPPING))
+                {
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                status = VenusMapForUser(&pVioGpuEscape->VenusMapping);
+                break;
+            }
+        case VIOGPU_VENUS_UNMAP:
+            {
+                status = VenusUnmapForUser();
                 break;
             }
         case VIOGPU_GET_CUSTOM_RESOLUTION:
@@ -5372,7 +5486,24 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     }
     else
     {
-        m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
+        if (m_bHostVirgl)
+        {
+            //
+            // On a virgl host every command goes through virglrenderer, and QEMU's CREATE_2D hardcodes
+            // VIRGL_RESOURCE_Y_0_TOP on the resource it makes -- which is what the inverted image tracks (a
+            // Linux guest shows the same flip until it leaves the 2D path for dmabuf). CREATE_3D builds the
+            // same 2D texture but takes its flags from the guest, so this is the only orientation lever we
+            // have without touching the host.
+            //
+            // No switch to set: we already know we are on a virgl host, since that is exactly the condition
+            // that disabled blob scanout a moment ago.
+            //
+            m_CtrlQueue.CreateResource3D(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0);
+        }
+        else
+        {
+            m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
+        }
         GpuObjectAttach(resid, obj);
         m_CtrlQueue.SetScanout(scanId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
         m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);

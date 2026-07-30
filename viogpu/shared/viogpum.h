@@ -33,6 +33,30 @@
 #define VIOGPU_GET_CUSTOM_RESOLUTION 0x01
 #define VIOGPU_SET_CUSTOM_RESOLUTION 0x02
 
+//
+// Venus bring-up escapes. Not the final transport ABI -- these exist to prove, from user mode, that a slice of
+// the host memory window can be reached and that both sides see the same bytes. Numbered well clear of the
+// display escapes above so the two can never be confused.
+//
+#define VIOGPU_VENUS_MAP   0x10
+#define VIOGPU_VENUS_UNMAP 0x11
+
+#pragma pack(1)
+typedef struct _VIOGPU_VENUS_MAPPING
+{
+    ULONGLONG UserAddress; // where the window slice landed in the calling process
+    ULONGLONG Size;
+    ULONG ResourceId;
+    ULONG MapInfo;   // host-dictated cache type
+    ULONG Pattern;   // seed the driver wrote; user mode checks it, then writes Pattern ^ VIOGPU_VENUS_XOR back
+    ULONG Reserved;
+} VIOGPU_VENUS_MAPPING, *PVIOGPU_VENUS_MAPPING;
+#pragma pack()
+
+// Applied by user mode to every dword so the driver can tell a real round trip from stale or zeroed memory.
+#define VIOGPU_VENUS_XOR       0x5A5A5A5Au
+#define VIOGPU_VENUS_TEST_SIZE 0x10000
+
 #pragma pack(1)
 typedef struct _VIOGPU_DISP_MODE
 {
@@ -50,6 +74,7 @@ typedef struct _VIOGPU_ESCAPE
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
+        VIOGPU_VENUS_MAPPING VenusMapping;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
 #pragma pack()

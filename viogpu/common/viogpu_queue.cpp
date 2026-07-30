@@ -498,6 +498,36 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_ve
     return TRUE;
 }
 
+//
+// The same 2D texture CREATE_2D would make, except the guest supplies the flags. QEMU's
+// virgl_cmd_create_resource_2d hardcodes VIRGL_RESOURCE_Y_0_TOP, so this is the only lever a guest has over
+// scanout orientation on a virgl host.
+//
+void CtrlQueue::CreateResource3D(UINT res_id, UINT format, UINT width, UINT height, UINT flags)
+{
+    PAGED_CODE();
+
+    PGPU_RES_CREATE_3D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_CREATE_3D)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    cmd->resource_id = res_id;
+    cmd->target = VIRGL_TARGET_TEXTURE_2D;
+    cmd->format = format;
+    cmd->bind = VIRGL_BIND_RENDER_TARGET;
+    cmd->width = width;
+    cmd->height = height;
+    cmd->depth = 1;
+    cmd->array_size = 1;
+    cmd->last_level = 0;
+    cmd->nr_samples = 0;
+    cmd->flags = flags;
+
+    QueueBuffer(vbuf);
+}
+
 void CtrlQueue::CreateCtx(UINT ctx_id, UINT context_init, PCSTR name)
 {
     PAGED_CODE();
