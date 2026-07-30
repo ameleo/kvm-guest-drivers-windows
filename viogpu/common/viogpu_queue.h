@@ -268,6 +268,14 @@ class CtrlQueue : public VioGpuQueue
     BOOLEAN AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx);
     BOOLEAN AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_version, ULONG capset_size);
 
+    // 3D context and host-visible blob plumbing (Venus transport). Unlike the scanout blob path these carry a
+    // ctx_id in the header and no guest pages: the memory lives on the host.
+    void CreateCtx(UINT ctx_id, UINT context_init, PCSTR name);
+    void DestroyCtx(UINT ctx_id);
+    void CreateBlobHost(UINT ctx_id, UINT res_id, UINT blob_mem, UINT blob_flags, ULONGLONG blob_id, ULONGLONG size);
+    BOOLEAN MapBlob(UINT ctx_id, UINT res_id, ULONGLONG offset, PULONG pMapInfo);
+    void UnmapBlob(UINT ctx_id, UINT res_id);
+
   private:
     volatile LONG m_FenceIdr;
 };

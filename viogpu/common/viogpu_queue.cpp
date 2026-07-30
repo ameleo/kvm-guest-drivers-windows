@@ -498,6 +498,163 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_ve
     return TRUE;
 }
 
+void CtrlQueue::CreateCtx(UINT ctx_id, UINT context_init, PCSTR name)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s ctx=%u init=0x%x\n", __FUNCTION__, ctx_id, context_init));
+
+    PGPU_CMD_CTX_CREATE cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_CTX_CREATE)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->context_init = context_init;
+
+    size_t nlen = 0;
+    if (name != NULL)
+    {
+        while (nlen < sizeof(cmd->debug_name) - 1 && name[nlen] != '\0')
+        {
+            cmd->debug_name[nlen] = name[nlen];
+            nlen++;
+        }
+    }
+    cmd->nlen = (ULONG)nlen;
+
+    QueueBuffer(vbuf);
+}
+
+void CtrlQueue::DestroyCtx(UINT ctx_id)
+{
+    PAGED_CODE();
+
+    PGPU_CTRL_HDR cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CTRL_HDR)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    cmd->ctx_id = ctx_id;
+
+    QueueBuffer(vbuf);
+}
+
+//
+// Blob whose storage lives on the HOST (blob_mem HOST3D), as opposed to the scanout path's MEM_GUEST blobs
+// backed by guest pages. There are therefore no mem entries to send -- blob_id names the host allocation, and
+// the special value 0 with MAPPABLE is the convention meaning "allocate host shmem for me".
+//
+void CtrlQueue::CreateBlobHost(UINT ctx_id, UINT res_id, UINT blob_mem, UINT blob_flags, ULONGLONG blob_id,
+                               ULONGLONG size)
+{
+    PAGED_CODE();
+
+    PGPU_RES_CREATE_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_CREATE_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+    cmd->blob_mem = blob_mem;
+    cmd->blob_flags = blob_flags;
+    cmd->nr_entries = 0;
+    cmd->blob_id = blob_id;
+    cmd->size = size;
+
+    QueueBuffer(vbuf);
+}
+
+//
+// Ask the host to place a blob at a given offset in the host-visible window. The guest owns the window's
+// address space and picks the offset; the host answers with the cache type the guest must then use.
+//
+BOOLEAN CtrlQueue::MapBlob(UINT ctx_id, UINT res_id, ULONGLONG offset, PULONG pMapInfo)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res=%u offset=0x%I64x\n", __FUNCTION__, res_id, offset));
+
+    PGPU_RESOURCE_MAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_MAP_INFO resp_buf;
+
+    resp_buf = reinterpret_cast<PGPU_RESP_MAP_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_MAP_INFO)]);
+    if (!resp_buf)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(resp_buf, sizeof(GPU_RESP_MAP_INFO));
+
+    cmd = (PGPU_RESOURCE_MAP_BLOB)AllocCmdResp(&vbuf,
+                                               sizeof(GPU_RESOURCE_MAP_BLOB),
+                                               resp_buf,
+                                               sizeof(GPU_RESP_MAP_INFO));
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_RESOURCE_MAP_BLOB));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
+    {
+        ReleaseBuffer(vbuf); // frees resp_buf too (resp_size > MAX_INLINE_RESP_SIZE)
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to map blob res = %u\n", res_id));
+        return FALSE;
+    }
+
+    BOOLEAN ok = FALSE;
+    PGPU_RESP_MAP_INFO resp = (PGPU_RESP_MAP_INFO)vbuf->resp_buf;
+    if (resp != NULL && resp->hdr.type == VIRTIO_GPU_RESP_OK_MAP_INFO)
+    {
+        if (pMapInfo != NULL)
+        {
+            *pMapInfo = resp->map_info & VIRTIO_GPU_MAP_CACHE_MASK;
+        }
+        ok = TRUE;
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("---> MAP_BLOB refused res = %u type = 0x%X\n", res_id, resp ? resp->hdr.type : 0));
+    }
+
+    ReleaseBuffer(vbuf);
+    return ok;
+}
+
+void CtrlQueue::UnmapBlob(UINT ctx_id, UINT res_id)
+{
+    PAGED_CODE();
+
+    PGPU_RESOURCE_UNMAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RESOURCE_UNMAP_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+
+    QueueBuffer(vbuf);
+}
+
 void CtrlQueue::CreateResource(UINT res_id, UINT format, UINT width, UINT height)
 {
     PAGED_CODE();

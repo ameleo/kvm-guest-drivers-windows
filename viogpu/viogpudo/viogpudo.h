@@ -100,6 +100,7 @@ class VioGpuAdapter : IVioGpuPCI
     VOID RecordHostCapsets(void);
     VOID DumpVenusCapset(ULONG version, ULONG size);
     VOID RecordHostVisibleWindow(void);
+    VOID ProbeVenusMemoryPath(void);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);
@@ -230,6 +231,7 @@ class VioGpuAdapter : IVioGpuPCI
     UINT64 m_u64GuestFeatures;
     BOOLEAN m_bBlobSupported;   // VIRTIO_GPU_F_RESOURCE_BLOB negotiated -> blob scanout path (else classic 2D)
     UINT32 m_u32NumCapsets;
+    BOOLEAN m_bVenusEligible;   // set by RecordHostCapsets; gates the Venus memory dry run
     UINT32 m_u32NumScanouts;
     CtrlQueue m_CtrlQueue;
     CrsrQueue m_CursorQueue;

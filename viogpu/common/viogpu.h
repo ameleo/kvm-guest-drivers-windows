@@ -71,6 +71,8 @@ enum virtio_gpu_ctrl_type
     VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
     VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
     VIRTIO_GPU_CMD_SUBMIT_3D,
+    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,   // 0x0208
+    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, // 0x0209
 
     /* cursor commands */
     VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
@@ -82,6 +84,8 @@ enum virtio_gpu_ctrl_type
     VIRTIO_GPU_RESP_OK_CAPSET_INFO,
     VIRTIO_GPU_RESP_OK_CAPSET,
     VIRTIO_GPU_RESP_OK_EDID,
+    VIRTIO_GPU_RESP_OK_RESOURCE_UUID, // 0x1105
+    VIRTIO_GPU_RESP_OK_MAP_INFO,      // 0x1106
 
     /* error responses */
     VIRTIO_GPU_RESP_ERR_UNSPEC = 0x1200,
@@ -352,6 +356,58 @@ typedef struct virtio_gpu_resp_capset_info
     ULONG capset_max_size;
     ULONG padding;
 } GPU_RESP_CAPSET_INFO, *PGPU_RESP_CAPSET_INFO;
+#pragma pack()
+
+/* VIRTIO_GPU_CMD_CTX_CREATE */
+#pragma pack(1)
+typedef struct virtio_gpu_ctx_create
+{
+    GPU_CTRL_HDR hdr;
+    ULONG nlen;
+    ULONG context_init; // low bits carry the capset id (VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK)
+    CHAR debug_name[64];
+} GPU_CMD_CTX_CREATE, *PGPU_CMD_CTX_CREATE;
+#pragma pack()
+
+/* VIRTIO_GPU_CMD_CTX_DESTROY -- the context is named by hdr.ctx_id alone */
+
+#define VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK 0x000000ff
+
+/* VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB */
+#pragma pack(1)
+typedef struct virtio_gpu_resource_map_blob
+{
+    GPU_CTRL_HDR hdr;
+    ULONG resource_id;
+    ULONG padding;
+    ULONGLONG offset; // where in the host-visible window the host must place this resource
+} GPU_RESOURCE_MAP_BLOB, *PGPU_RESOURCE_MAP_BLOB;
+#pragma pack()
+
+/* VIRTIO_GPU_RESP_OK_MAP_INFO: the host dictates the cache type; the guest does not get to choose. */
+#define VIRTIO_GPU_MAP_CACHE_MASK     0x0f
+#define VIRTIO_GPU_MAP_CACHE_NONE     0x00
+#define VIRTIO_GPU_MAP_CACHE_CACHED   0x01
+#define VIRTIO_GPU_MAP_CACHE_UNCACHED 0x02
+#define VIRTIO_GPU_MAP_CACHE_WC       0x03
+
+#pragma pack(1)
+typedef struct virtio_gpu_resp_map_info
+{
+    GPU_CTRL_HDR hdr;
+    ULONG map_info; // cache type the guest must use for this mapping
+    ULONG padding;
+} GPU_RESP_MAP_INFO, *PGPU_RESP_MAP_INFO;
+#pragma pack()
+
+/* VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB */
+#pragma pack(1)
+typedef struct virtio_gpu_resource_unmap_blob
+{
+    GPU_CTRL_HDR hdr;
+    ULONG resource_id;
+    ULONG padding;
+} GPU_RESOURCE_UNMAP_BLOB, *PGPU_RESOURCE_UNMAP_BLOB;
 #pragma pack()
 
 //

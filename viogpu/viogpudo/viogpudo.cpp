@@ -2552,6 +2552,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_u64HostFeatures = 0;
     m_u64GuestFeatures = 0;
     m_u32NumCapsets = 0;
+    m_bVenusEligible = FALSE;
     m_u32NumScanouts = 0;
 
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
@@ -2825,6 +2826,85 @@ VOID VioGpuAdapter::RecordHostCapabilities(void)
 }
 
 //
+// One-shot dry run of the Venus memory foundation, on a throwaway context, touching nothing the display path
+// owns. It answers in a single boot the three questions the transport rests on:
+//
+//   1. does the host grant a context bound to the Venus capset,
+//   2. does blob_id 0 + HOST3D + MAPPABLE really allocate host shmem (the convention Mesa depends on),
+//   3. does RESOURCE_MAP_BLOB place it in the window, and what cache type does the host dictate.
+//
+// Everything is torn down before returning. A failure at any step is logged and abandoned: this must never
+// affect a machine that only ever wanted a display.
+//
+VOID VioGpuAdapter::ProbeVenusMemoryPath(void)
+{
+    PAGED_CODE();
+
+    // Ids reserved for this probe alone. The context is destroyed before anything else uses the device, and
+    // the resource id comes from the same generator as the rest so it can never collide with a scanout blob.
+    const UINT ctxId = 1;
+    const ULONGLONG size = 0x10000; // 64 KB is plenty to prove the path
+    UINT resId = (UINT)m_Idr.GetId();
+
+    if (resId == 0)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s no resource id available\n", __FUNCTION__));
+        return;
+    }
+
+    m_CtrlQueue.CreateCtx(ctxId, VIRTIO_GPU_CAPSET_VENUS, "viogpu-probe");
+
+    // blob_id 0 with HOST3D + MAPPABLE is the "allocate host shmem" convention, gated by the capset's
+    // supports_blob_id_0 flag that this host advertises.
+    m_CtrlQueue.CreateBlobHost(ctxId,
+                               resId,
+                               VIRTIO_GPU_BLOB_MEM_HOST3D,
+                               VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+                               0,
+                               size);
+
+    ULONG mapInfo = 0;
+    if (m_CtrlQueue.MapBlob(ctxId, resId, 0, &mapInfo))
+    {
+        PCSTR cache = "unknown";
+        switch (mapInfo)
+        {
+            case VIRTIO_GPU_MAP_CACHE_CACHED:
+                cache = "cached";
+                break;
+            case VIRTIO_GPU_MAP_CACHE_UNCACHED:
+                cache = "uncached";
+                break;
+            case VIRTIO_GPU_MAP_CACHE_WC:
+                cache = "write-combined";
+                break;
+            default:
+                break;
+        }
+
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s VENUS MEMORY PATH OK: ctx=%u res=%u size=0x%I64x mapped at window offset 0 map_info=%lu "
+                  "(%s)\n",
+                  __FUNCTION__,
+                  ctxId,
+                  resId,
+                  size,
+                  mapInfo,
+                  cache));
+
+        m_CtrlQueue.UnmapBlob(ctxId, resId);
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s venus memory path FAILED at MAP_BLOB\n", __FUNCTION__));
+    }
+
+    m_CtrlQueue.DestroyResource(resId);
+    m_CtrlQueue.DestroyCtx(ctxId);
+    m_Idr.PutId(resId);
+}
+
+//
 // Walk the PCI capability list for the host-visible shared memory region. This is NOT in the virtio config
 // space nor in the feature bits: it only exists as a PCI capability, so nothing already read tells us whether
 // the host reserved a window at all.
@@ -3066,6 +3146,7 @@ VOID VioGpuAdapter::RecordHostCapsets(void)
     // ask for a Venus context, so the capset alone would be unreachable.
     //
     const ULONG venusEligible = (venus && ctxInit) ? 1 : 0;
+    m_bVenusEligible = venusEligible ? TRUE : FALSE;
 
     DbgPrint(TRACE_LEVEL_FATAL,
              ("%s capset mask=0x%I64x virgl=%lu virgl2=%lu venus=%lu -> Venus eligible=%lu\n",
@@ -3320,6 +3401,12 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     //
     RecordHostCapsets();
     RecordHostVisibleWindow();
+
+    // Only on a host that could actually carry Venus. Elsewhere this must not emit a single command.
+    if (m_bVenusEligible)
+    {
+        ProbeVenusMemoryPath();
+    }
 
     status = BuildModeList(pDispInfo);
     if (!NT_SUCCESS(status))
