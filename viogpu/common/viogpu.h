@@ -354,6 +354,31 @@ typedef struct virtio_gpu_resp_capset_info
 } GPU_RESP_CAPSET_INFO, *PGPU_RESP_CAPSET_INFO;
 #pragma pack()
 
+//
+// Host memory window (QEMU `hostmem=`), advertised as a virtio shared memory region rather than a plain BAR:
+// a PCI capability of type 8 naming a BAR plus a 64-bit offset and length. Venus maps every host-visible
+// allocation into it, so its size is a ceiling on CONCURRENTLY MAPPED memory -- nothing evicts from it.
+//
+#define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
+#define VIRTIO_GPU_SHM_ID_HOST_VISIBLE   1
+
+#pragma pack(1)
+typedef struct virtio_pci_cap64
+{
+    UCHAR cap_vndr; // PCI_CAPABILITY_ID_VENDOR_SPECIFIC
+    UCHAR cap_next;
+    UCHAR cap_len;
+    UCHAR cfg_type; // VIRTIO_PCI_CAP_SHARED_MEMORY_CFG
+    UCHAR bar;
+    UCHAR id; // which region: VIRTIO_GPU_SHM_ID_HOST_VISIBLE
+    UCHAR padding[2];
+    ULONG offset;
+    ULONG length;
+    ULONG offset_hi;
+    ULONG length_hi;
+} VIRTIO_PCI_CAP64, *PVIRTIO_PCI_CAP64;
+#pragma pack()
+
 /* VIRTIO_GPU_CMD_GET_CAPSET */
 #pragma pack(1)
 typedef struct virtio_gpu_cmd_get_capset

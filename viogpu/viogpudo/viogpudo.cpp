@@ -2824,6 +2824,115 @@ VOID VioGpuAdapter::RecordHostCapabilities(void)
     ZwClose(hKey);
 }
 
+//
+// Walk the PCI capability list for the host-visible shared memory region. This is NOT in the virtio config
+// space nor in the feature bits: it only exists as a PCI capability, so nothing already read tells us whether
+// the host reserved a window at all.
+//
+// Reported, not consumed: a render path would place allocations in this window and tell the host where with
+// RESOURCE_MAP_BLOB. Knowing the window exists, and how big it is, is the prerequisite for that decision.
+//
+VOID VioGpuAdapter::RecordHostVisibleWindow(void)
+{
+    PAGED_CODE();
+
+    PDXGKRNL_INTERFACE pDxgk = m_pVioGpuDod->GetDxgkInterface();
+    ULONG bytesRead = 0;
+    UCHAR capPtr = 0;
+    ULONGLONG windowLen = 0;
+    ULONGLONG windowOff = 0;
+    ULONG windowBar = 0;
+    BOOLEAN found = FALSE;
+
+    // Capability list head lives at offset 0x34 of the type 0 header.
+    if (!NT_SUCCESS(pDxgk->DxgkCbReadDeviceSpace(pDxgk->DeviceHandle,
+                                                 DXGK_WHICHSPACE_CONFIG,
+                                                 &capPtr,
+                                                 FIELD_OFFSET(PCI_COMMON_HEADER, u.type0.CapabilitiesPtr),
+                                                 sizeof(capPtr),
+                                                 &bytesRead)))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s cannot read the capability pointer\n", __FUNCTION__));
+        return;
+    }
+
+    // Bounded walk: a malformed or looping list must not hang the boot.
+    for (ULONG guard = 0; capPtr >= 0x40 && guard < 48; guard++)
+    {
+        VIRTIO_PCI_CAP64 cap = {0};
+
+        if (!NT_SUCCESS(pDxgk->DxgkCbReadDeviceSpace(pDxgk->DeviceHandle,
+                                                     DXGK_WHICHSPACE_CONFIG,
+                                                     &cap,
+                                                     capPtr,
+                                                     sizeof(cap),
+                                                     &bytesRead)) ||
+            bytesRead != sizeof(cap))
+        {
+            break;
+        }
+
+        if (cap.cap_vndr == PCI_CAPABILITY_ID_VENDOR_SPECIFIC && cap.cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG &&
+            cap.cap_len >= sizeof(VIRTIO_PCI_CAP64))
+        {
+            const ULONGLONG len = ((ULONGLONG)cap.length_hi << 32) | cap.length;
+            const ULONGLONG off = ((ULONGLONG)cap.offset_hi << 32) | cap.offset;
+
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s shm region id=%u bar=%u offset=0x%I64x length=0x%I64x (%I64u MB)\n",
+                      __FUNCTION__,
+                      cap.id,
+                      cap.bar,
+                      off,
+                      len,
+                      len >> 20));
+
+            if (cap.id == VIRTIO_GPU_SHM_ID_HOST_VISIBLE)
+            {
+                windowBar = cap.bar;
+                windowOff = off;
+                windowLen = len;
+                found = TRUE;
+            }
+        }
+
+        capPtr = cap.cap_next;
+    }
+
+    if (!found)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s no host-visible window (hostmem= not set?)\n", __FUNCTION__));
+    }
+
+    PCUNICODE_STRING pPath = m_pVioGpuDod->GetDeviceRegistryPath();
+    if (pPath == NULL || pPath->Length == 0)
+    {
+        return;
+    }
+
+    OBJECT_ATTRIBUTES attr;
+    HANDLE hKey = NULL;
+
+    InitializeObjectAttributes(&attr,
+                               const_cast<PUNICODE_STRING>(pPath),
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL,
+                               NULL);
+
+    if (!NT_SUCCESS(ZwOpenKey(&hKey, KEY_SET_VALUE, &attr)))
+    {
+        return;
+    }
+
+    ProbeWriteDword(hKey, L"HostVisibleWindow", found ? 1 : 0);
+    ProbeWriteDword(hKey, L"HostVisibleWindowBar", windowBar);
+    ProbeWriteDword(hKey, L"HostVisibleWindowMB", (ULONG)(windowLen >> 20));
+    ProbeWriteDword(hKey, L"HostVisibleWindowOffsetLo", (ULONG)(windowOff & 0xFFFFFFFF));
+    ProbeWriteDword(hKey, L"HostVisibleWindowOffsetHi", (ULONG)(windowOff >> 32));
+
+    ZwClose(hKey);
+}
+
 VOID VioGpuAdapter::DumpVenusCapset(ULONG version, ULONG size)
 {
     PAGED_CODE();
@@ -3210,6 +3319,7 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     // both of which happen after VioGpuAdapterInit returns.
     //
     RecordHostCapsets();
+    RecordHostVisibleWindow();
 
     status = BuildModeList(pDispInfo);
     if (!NT_SUCCESS(status))
