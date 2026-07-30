@@ -2553,6 +2553,9 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_u64GuestFeatures = 0;
     m_u32NumCapsets = 0;
     m_bVenusEligible = FALSE;
+    m_HostVisibleBar = 0;
+    m_HostVisibleOffset = 0;
+    m_HostVisibleLen = 0;
     m_u32NumScanouts = 0;
 
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
@@ -2836,6 +2839,117 @@ VOID VioGpuAdapter::RecordHostCapabilities(void)
 // Everything is torn down before returning. A failure at any step is logged and abandoned: this must never
 // affect a machine that only ever wanted a display.
 //
+//
+// The window is host RAM behind a BAR, and the host asked for CACHED. That is the unusual part: a PCI range is
+// normally mapped uncached or write-combined, and mapping MMIO cached is a mistake. Here it is what the host
+// dictates, so the question is whether Windows will accept it -- and whether the memory is really there.
+//
+// Called only after RESOURCE_MAP_BLOB succeeded: before that the host has placed nothing at this offset and
+// the contents are undefined.
+//
+VOID VioGpuAdapter::TouchHostVisibleWindow(ULONG mapInfo, ULONGLONG size)
+{
+    PAGED_CODE();
+
+    if (m_HostVisibleLen == 0)
+    {
+        return;
+    }
+
+    CPciBar *pBar = m_PciResources.GetPciBar(m_HostVisibleBar);
+    if (pBar == NULL || pBar->GetSize() == 0)
+    {
+        //
+        // Worth logging loudly rather than skipping quietly: the capability names this BAR, so if PnP did not
+        // hand it to us the window is unreachable no matter what the host advertises. Windows describes BARs of
+        // 4 GB and over with CmResourceTypeMemoryLarge, which our resource walk does not decode.
+        //
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s BAR %lu absent from the resource list -- window unreachable\n", __FUNCTION__,
+                  m_HostVisibleBar));
+        return;
+    }
+
+    // The blob sits at offset 0 of the window, and the window starts at the capability's offset inside the BAR.
+    PHYSICAL_ADDRESS pa = pBar->GetPA();
+    pa.QuadPart += m_HostVisibleOffset;
+
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s window BAR %lu bar_pa=0x%I64x + 0x%I64x -> pa=0x%I64x (bar size 0x%x)\n",
+              __FUNCTION__,
+              m_HostVisibleBar,
+              pBar->GetPA().QuadPart,
+              m_HostVisibleOffset,
+              pa.QuadPart,
+              pBar->GetSize()));
+
+    // Honour what the host answered rather than assuming. PAGE_READWRITE alone means cached.
+    ULONG protect = PAGE_READWRITE;
+    PCSTR how = "cached";
+
+    if (mapInfo == VIRTIO_GPU_MAP_CACHE_WC)
+    {
+        protect = PAGE_READWRITE | PAGE_WRITECOMBINE;
+        how = "write-combined";
+    }
+    else if (mapInfo == VIRTIO_GPU_MAP_CACHE_UNCACHED)
+    {
+        protect = PAGE_READWRITE | PAGE_NOCACHE;
+        how = "uncached";
+    }
+
+    PVOID va = MmMapIoSpaceEx(pa, (SIZE_T)size, protect);
+    if (va == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s MmMapIoSpaceEx REFUSED a %s mapping of 0x%I64x bytes\n", __FUNCTION__,
+                                     how, size));
+        return;
+    }
+
+    //
+    // Write a pattern and read it back. This is what separates "the mapping call succeeded" from "the window is
+    // real memory that holds what we put in it".
+    //
+    volatile ULONG *p = (volatile ULONG *)va;
+    const ULONG count = 16;
+    BOOLEAN ok = TRUE;
+
+    for (ULONG i = 0; i < count; i++)
+    {
+        p[i] = 0xA5A50000u | i;
+    }
+
+    KeMemoryBarrier();
+
+    for (ULONG i = 0; i < count; i++)
+    {
+        const ULONG got = p[i];
+        if (got != (0xA5A50000u | i))
+        {
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s window readback MISMATCH at %lu: wrote 0x%08X read 0x%08X\n",
+                      __FUNCTION__,
+                      i,
+                      0xA5A50000u | i,
+                      got));
+            ok = FALSE;
+            break;
+        }
+    }
+
+    if (ok)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s WINDOW MAPPING OK: %s, wrote and read back %lu dwords at va=%p\n",
+                  __FUNCTION__,
+                  how,
+                  count,
+                  va));
+    }
+
+    MmUnmapIoSpace(va, (SIZE_T)size);
+}
+
 VOID VioGpuAdapter::ProbeVenusMemoryPath(void)
 {
     PAGED_CODE();
@@ -2891,6 +3005,8 @@ VOID VioGpuAdapter::ProbeVenusMemoryPath(void)
                   size,
                   mapInfo,
                   cache));
+
+        TouchHostVisibleWindow(mapInfo, size);
 
         m_CtrlQueue.UnmapBlob(ctxId, resId);
     }
@@ -2973,6 +3089,10 @@ VOID VioGpuAdapter::RecordHostVisibleWindow(void)
                 windowOff = off;
                 windowLen = len;
                 found = TRUE;
+
+                m_HostVisibleBar = cap.bar;
+                m_HostVisibleOffset = off;
+                m_HostVisibleLen = len;
             }
         }
 

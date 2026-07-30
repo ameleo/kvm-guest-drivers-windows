@@ -101,6 +101,7 @@ class VioGpuAdapter : IVioGpuPCI
     VOID DumpVenusCapset(ULONG version, ULONG size);
     VOID RecordHostVisibleWindow(void);
     VOID ProbeVenusMemoryPath(void);
+    VOID TouchHostVisibleWindow(ULONG mapInfo, ULONGLONG size);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);
@@ -232,6 +233,11 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN m_bBlobSupported;   // VIRTIO_GPU_F_RESOURCE_BLOB negotiated -> blob scanout path (else classic 2D)
     UINT32 m_u32NumCapsets;
     BOOLEAN m_bVenusEligible;   // set by RecordHostCapsets; gates the Venus memory dry run
+    // Host-visible window, as discovered from the PCI capability (never assumed: the BAR index and offset
+    // are per-host). m_HostVisibleLen == 0 means no window was advertised.
+    ULONG m_HostVisibleBar;
+    ULONGLONG m_HostVisibleOffset;
+    ULONGLONG m_HostVisibleLen;
     UINT32 m_u32NumScanouts;
     CtrlQueue m_CtrlQueue;
     CrsrQueue m_CursorQueue;
