@@ -47,6 +47,10 @@ int bBreakAlways;
 tDebugPrintFunc VirtioDebugPrintProc;
 
 #ifdef DBG
+#if defined(COM_DEBUG)
+void InitializeSerialPort(void);
+#endif
+
 void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(DriverObject);
@@ -61,6 +65,10 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
     bBreakAlways = 1;
     nDebugLevel = TRACE_LEVEL_FATAL;
 #if defined(COM_DEBUG)
+    //
+    // The port has to be programmed before anything is written to it, or the output is lost silently.
+    //
+    InitializeSerialPort();
     VirtioDebugPrintProc = DebugPrintFuncSerial;
 #elif defined(PRINT_DEBUG)
     VirtioDebugPrintProc = DebugPrintFuncKdPrint;
@@ -657,14 +665,59 @@ VOID APIENTRY VioGpuDodSystemDisplayWrite(_In_ VOID *pDeviceContext,
 
 #if defined(COM_DEBUG)
 
-#define RHEL_DEBUG_PORT  ((PUCHAR)0x3F8)
+#define RHEL_DEBUG_PORT     ((PUCHAR)0x3F8)        // transmit holding register (and divisor low, when DLAB=1)
+#define RHEL_DEBUG_PORT_IER ((PUCHAR)(0x3F8 + 1))  // interrupt enable (and divisor high, when DLAB=1)
+#define RHEL_DEBUG_PORT_FCR ((PUCHAR)(0x3F8 + 2))  // FIFO control
+#define RHEL_DEBUG_PORT_LCR ((PUCHAR)(0x3F8 + 3))  // line control
+#define RHEL_DEBUG_PORT_LSR ((PUCHAR)(0x3F8 + 5))  // line status
+
+#define RHEL_LSR_THR_EMPTY 0x20  // transmit holding register ready to accept a byte
+#define RHEL_LCR_DLAB      0x80  // divisor latch access
+#define RHEL_LCR_8N1       0x03
+
+// Bounded: if no UART answers, the trace is lost rather than the machine.
+#define RHEL_DEBUG_TX_SPIN 20000
+
 #define TEMP_BUFFER_SIZE 256
+
+//
+// Program the UART: 115200 8N1, FIFOs on, interrupts off (this path only ever polls).
+//
+void InitializeSerialPort(void)
+{
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT_IER, 0x00);
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT_LCR, RHEL_LCR_DLAB);
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT, 0x01);   // divisor = 1 -> 115200 baud
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT_IER, 0x00);
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT_LCR, RHEL_LCR_8N1);
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT_FCR, 0xC7);
+}
+
+//
+// Transmit one byte, waiting for the holding register to drain first.
+//
+// The original pushed the whole buffer at the port with WRITE_PORT_BUFFER_UCHAR and never consulted the line
+// status register, nor configured the port. A 16550 takes one byte at a time; writing faster than it drains
+// simply overwrites the holding register, so most of the output is lost - and on an unconfigured port, all of it.
+//
+static void SerialPutChar(UCHAR c)
+{
+    ULONG spin = RHEL_DEBUG_TX_SPIN;
+
+    while (spin != 0 && (READ_PORT_UCHAR(RHEL_DEBUG_PORT_LSR) & RHEL_LSR_THR_EMPTY) == 0)
+    {
+        KeStallExecutionProcessor(1);
+        spin--;
+    }
+    WRITE_PORT_UCHAR(RHEL_DEBUG_PORT, c);
+}
 
 void DebugPrintFuncSerial(const char *format, ...)
 {
     char buf[TEMP_BUFFER_SIZE];
     NTSTATUS status;
     size_t len;
+    size_t i;
     va_list list;
     va_start(list, format);
     status = RtlStringCbVPrintfA(buf, sizeof(buf), format, list);
@@ -678,10 +731,13 @@ void DebugPrintFuncSerial(const char *format, ...)
         buf[0] = 'O';
         buf[1] = '\n';
     }
-    if (len)
+    for (i = 0; i < len; i++)
     {
-        WRITE_PORT_BUFFER_UCHAR(RHEL_DEBUG_PORT, (PUCHAR)buf, (ULONG)len);
-        WRITE_PORT_UCHAR(RHEL_DEBUG_PORT, '\r');
+        if (buf[i] == '\n')
+        {
+            SerialPutChar('\r');
+        }
+        SerialPutChar((UCHAR)buf[i]);
     }
     va_end(list);
 }

@@ -39,16 +39,5 @@ class VioGpuIdr
     VOID PutId(_In_ ULONG id);
 
   private:
-    VOID Close(VOID);
-
-  private:
-    struct FreeId
-    {
-        LIST_ENTRY list_entry;
-        ULONG id;
-    };
-
     ULONG m_nextId;
-    KSPIN_LOCK m_lock;
-    LIST_ENTRY m_freeList;
 };

@@ -37,18 +37,14 @@
 VioGpuIdr::VioGpuIdr()
 {
     m_nextId = 0;
-    KeInitializeSpinLock(&m_lock);
-    InitializeListHead(&m_freeList);
 }
 
 VioGpuIdr::~VioGpuIdr()
 {
-    Close();
 }
 
 BOOLEAN VioGpuIdr::Init(_In_ ULONG start)
 {
-    Close();
     m_nextId = start;
 
     return true;
@@ -69,21 +65,8 @@ ULONG VioGpuIdr::GetId(VOID)
 
 VOID VioGpuIdr::PutId(_In_ ULONG id)
 {
-    // No-op: ids are never recycled (see GetId) — recycling caused the destroy-recreate-same-id 0x1200 hazard.
+    // No-op, kept so the call sites still mark where an id stops being used: ids are never recycled (see GetId),
+    // recycling caused the destroy-recreate-same-id 0x1200 hazard.
     UNREFERENCED_PARAMETER(id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d (not recycled)\n", __FUNCTION__, id));
-}
-
-VOID VioGpuIdr::Close(VOID)
-{
-
-    FreeId *freeId = NULL;
-    do
-    {
-        freeId = reinterpret_cast<FreeId *>(ExInterlockedRemoveHeadList(&m_freeList, &m_lock));
-        if (freeId != NULL)
-        {
-            delete freeId;
-        }
-    } while (freeId != NULL);
 }

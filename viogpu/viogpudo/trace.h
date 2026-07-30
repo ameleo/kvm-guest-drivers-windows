@@ -16,15 +16,42 @@
 #define TRACE_LEVEL_RESERVED9   9
 #endif // TRACE_LEVEL_INFORMATION
 
+//
+// Debugging aid, off by default: route DbgPrint to COM1 (0x3F8) instead of the kernel debugger.
+//
+// When the display path is what is being debugged there is no screen to start a trace collector from. The serial
+// writer needs nothing in the guest - run QEMU with `-serial file:viogpu-trace.log` and read it on the host.
+// It reprograms COM1 when the driver loads and writes every FATAL trace there, so it must never be on in a build
+// given to guests that may use COM1 (a serial console, kdcom).
+//
+// It only takes effect in a DBG build. "Win11 Release|x64" is one (see below); the other configurations use WPP.
+//
+#ifndef VIOGPU_SERIAL_TRACE
+#define VIOGPU_SERIAL_TRACE 0
+#endif
+
 #if DBG
+//
+// CAREFUL: this branch is the one that is actually taken by the shipping build. "Win11 Release|x64" is the only
+// configuration in viogpudo.vcxproj with UseDebugLibraries=true, which defines DBG=1 - so the driver is built
+// with debug semantics (NT_ASSERT armed included) despite the configuration being named Release.
+//
+// VIOGPU_SERIAL_TRACE therefore has to steer THIS branch as well, otherwise it silently selects a code path that
+// is never compiled: PRINT_DEBUG routes DbgPrint to vDbgPrintEx, i.e. to a kernel debugger, and nothing ever
+// reaches the serial port no matter what the #else branch says.
+//
+#if VIOGPU_SERIAL_TRACE
+#define COM_DEBUG 1
+#else
 #define PRINT_DEBUG 1
-//#define COM_DEBUG 1
+#endif
 
     extern int nDebugLevel;
     extern int bBreakAlways;
 
     void DebugPrintFuncSerial(const char *format, ...);
     void DebugPrintFuncKdPrint(const char *format, ...);
+    void InitializeSerialPort(void);
 #define DbgExpandArguments(...) __VA_ARGS__
 #define DbgPrint(Level, MSG) \
     if (Level <= nDebugLevel) VirtioDebugPrintProc(DbgExpandArguments MSG);
