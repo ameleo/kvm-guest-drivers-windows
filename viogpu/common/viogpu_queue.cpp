@@ -378,6 +378,64 @@ BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid)
     return TRUE;
 }
 
+//
+// Query one capset table entry by INDEX. The host reports how many entries exist (num_capsets in the config
+// space) but not what they are: the id -- VIRGL, VENUS, ... -- only comes back in the response. So knowing a
+// host is "3D capable" says nothing about WHICH 3D protocol it speaks; that needs this round trip per index.
+//
+BOOLEAN CtrlQueue::AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s idx = %lu\n", __FUNCTION__, idx));
+
+    PGPU_CMD_GET_CAPSET_INFO cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_CAPSET_INFO resp_buf;
+
+    resp_buf = reinterpret_cast<PGPU_RESP_CAPSET_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_CAPSET_INFO)]);
+
+    if (!resp_buf)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("---> %s Failed allocate %d bytes\n", __FUNCTION__, sizeof(GPU_RESP_CAPSET_INFO)));
+        return FALSE;
+    }
+
+    cmd = (PGPU_CMD_GET_CAPSET_INFO)AllocCmdResp(&vbuf,
+                                                 sizeof(GPU_CMD_GET_CAPSET_INFO),
+                                                 resp_buf,
+                                                 sizeof(GPU_RESP_CAPSET_INFO));
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_CAPSET_INFO));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    cmd->capset_index = idx;
+
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
+    {
+        ReleaseBuffer(vbuf); // frees resp_buf too (resp_size > MAX_INLINE_RESP_SIZE)
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        // Survivable: the caller just skips this index. The buffer belongs to the wait machinery from here.
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to ask capset info idx = %lu\n", idx));
+        return FALSE;
+    }
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
 void CtrlQueue::CreateResource(UINT res_id, UINT format, UINT width, UINT height)
 {
     PAGED_CODE();

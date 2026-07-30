@@ -90,6 +90,14 @@ class VioGpuAdapter : IVioGpuPCI
     NTSTATUS SetPowerState(DXGK_DEVICE_INFO *pDeviceInfo,
                            DEVICE_POWER_STATE DevicePowerState,
                            CURRENT_MODE *pCurrentMode);
+
+    //
+    // Publish what the host offers into the device's registry key. Purely observational: it records the
+    // capabilities a render mode would need, so a fleet can be surveyed before any driver starts relying on
+    // them. Failure to write is not an error worth failing a device start over.
+    //
+    VOID RecordHostCapabilities(void);
+    VOID RecordHostCapsets(void);
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);
@@ -301,6 +309,12 @@ class VioGpuDod
   public:
     VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject);
     ~VioGpuDod(void);
+
+    // The device's own registry key, filled by DxgkCbGetDeviceInformation at StartDevice.
+    PCUNICODE_STRING GetDeviceRegistryPath(void) const
+    {
+        return &m_DeviceInfo.DeviceRegistryPath;
+    }
 #pragma code_seg(push)
 #pragma code_seg()
     BOOLEAN IsDriverActive() const

@@ -332,6 +332,39 @@ typedef struct virtio_gpu_resp_edid
 } GPU_RESP_EDID, *PGPU_RESP_EDID;
 #pragma pack()
 
+/* VIRTIO_GPU_CMD_GET_CAPSET_INFO */
+#pragma pack(1)
+typedef struct virtio_gpu_cmd_get_capset_info
+{
+    GPU_CTRL_HDR hdr;
+    ULONG capset_index;
+    ULONG padding;
+} GPU_CMD_GET_CAPSET_INFO, *PGPU_CMD_GET_CAPSET_INFO;
+#pragma pack()
+
+/* VIRTIO_GPU_RESP_OK_CAPSET_INFO */
+#pragma pack(1)
+typedef struct virtio_gpu_resp_capset_info
+{
+    GPU_CTRL_HDR hdr;
+    ULONG capset_id;
+    ULONG capset_max_version;
+    ULONG capset_max_size;
+    ULONG padding;
+} GPU_RESP_CAPSET_INFO, *PGPU_RESP_CAPSET_INFO;
+#pragma pack()
+
+//
+// Capset ids are indices into a per-host table, NOT a bitmask: the host reports how many entries it has
+// (num_capsets) and each one must be queried by index to learn its id. Valid ids run from 1 to 63.
+//
+#define VIRTIO_GPU_CAPSET_VIRGL        1
+#define VIRTIO_GPU_CAPSET_VIRGL2       2
+#define VIRTIO_GPU_CAPSET_GFXSTREAM    3
+#define VIRTIO_GPU_CAPSET_VENUS        4
+#define VIRTIO_GPU_CAPSET_CROSS_DOMAIN 5
+#define VIRTIO_GPU_CAPSET_MAX_ID       63
+
 #define EDID_V1_BLOCK_SIZE  128
 #define EDID_RAW_BLOCK_SIZE 256
 
@@ -373,7 +406,9 @@ typedef struct _COLOR_CHARACTERISTICS
 
 #define VIRTIO_GPU_F_VIRGL         0
 #define VIRTIO_GPU_F_EDID          1
+#define VIRTIO_GPU_F_RESOURCE_UUID 2
 #define VIRTIO_GPU_F_RESOURCE_BLOB 3   // guest-memory blob scanout (udmabuf dmabuf export, no host GL upload)
+#define VIRTIO_GPU_F_CONTEXT_INIT  4   // per-context capset selection; required by any render path
 
 #define ISR_REASON_DISPLAY 1
 #define ISR_REASON_CURSOR  2

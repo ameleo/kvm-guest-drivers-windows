@@ -2679,6 +2679,15 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit(DXGK_DISPLAY_INFORMATION *pDispInfo)
                           sizeof(m_u32NumScanouts));
 
         virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, num_capsets), &m_u32NumCapsets, sizeof(m_u32NumCapsets));
+
+        //
+        // Record what this host can do. Nothing here changes behaviour - the values are written for the outside
+        // world to read, so a fleet can be surveyed for 3D eligibility without touching a single guest.
+        //
+        // The features are read from what the host OFFERED, not from what was acknowledged: the display path
+        // deliberately negotiates only what it needs, so acknowledging virgl here would be a lie about intent.
+        //
+        RecordHostCapabilities();
     } while (0);
     if (status == STATUS_SUCCESS)
     {
@@ -2738,6 +2747,182 @@ BOOLEAN VioGpuAdapter::AckFeature(UINT64 Feature)
         return TRUE;
     }
     return FALSE;
+}
+
+//
+// Write one DWORD under the device's key, ignoring failures.
+//
+static VOID ProbeWriteDword(_In_ HANDLE hKey, _In_ PCWSTR pName, _In_ ULONG Value)
+{
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, pName);
+    ZwSetValueKey(hKey, &name, 0, REG_DWORD, &Value, sizeof(Value));
+}
+
+VOID VioGpuAdapter::RecordHostCapabilities(void)
+{
+    PAGED_CODE();
+
+    PCUNICODE_STRING pPath = m_pVioGpuDod->GetDeviceRegistryPath();
+    if (pPath == NULL || pPath->Length == 0)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s no device registry path; capabilities not recorded\n", __FUNCTION__));
+        return;
+    }
+
+    //
+    // What a render mode would need. Read from the OFFERED feature bits: the display path negotiates only what
+    // it uses, so the acknowledged set would understate the host.
+    //
+    const ULONG virgl = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_VIRGL) ? 1 : 0;
+    const ULONG blob = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_RESOURCE_BLOB) ? 1 : 0;
+    const ULONG ctxInit = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_CONTEXT_INIT) ? 1 : 0;
+    const ULONG resUuid = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_RESOURCE_UUID) ? 1 : 0;
+    const ULONG eligible = (virgl && blob && ctxInit) ? 1 : 0;
+
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s host caps: virgl=%lu blob=%lu ctx_init=%lu res_uuid=%lu capsets=%lu scanouts=%lu -> 3D "
+              "eligible=%lu\n",
+              __FUNCTION__,
+              virgl,
+              blob,
+              ctxInit,
+              resUuid,
+              m_u32NumCapsets,
+              m_u32NumScanouts,
+              eligible));
+
+    OBJECT_ATTRIBUTES attr;
+    HANDLE hKey = NULL;
+    NTSTATUS status;
+
+    InitializeObjectAttributes(&attr,
+                               const_cast<PUNICODE_STRING>(pPath),
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL,
+                               NULL);
+
+    status = ZwOpenKey(&hKey, KEY_SET_VALUE, &attr);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s cannot open the device key: 0x%X\n", __FUNCTION__, status));
+        return;
+    }
+
+    ProbeWriteDword(hKey, L"HostFeatureVirgl", virgl);
+    ProbeWriteDword(hKey, L"HostFeatureResourceBlob", blob);
+    ProbeWriteDword(hKey, L"HostFeatureContextInit", ctxInit);
+    ProbeWriteDword(hKey, L"HostFeatureResourceUuid", resUuid);
+    ProbeWriteDword(hKey, L"HostNumCapsets", m_u32NumCapsets);
+    ProbeWriteDword(hKey, L"HostNumScanouts", m_u32NumScanouts);
+
+    //
+    // The one value worth reading from outside: whether this host could carry a render driver at all.
+    //
+    ProbeWriteDword(hKey, L"Host3dEligible", eligible);
+
+    ZwClose(hKey);
+}
+
+VOID VioGpuAdapter::RecordHostCapsets(void)
+{
+    PAGED_CODE();
+
+    //
+    // "3D eligible" says a render path is POSSIBLE, not which protocol the host speaks. That comes from the
+    // capset table, and only by asking: num_capsets is a COUNT, the ids live in the per-index responses. A
+    // stock virtio-gpu-gl host answers 2 (VIRGL + VIRGL2); Venus needs an explicitly built and enabled host,
+    // so its absence here is the difference between "3D" and "the 3D we want".
+    //
+    ULONGLONG mask = 0;
+
+    for (ULONG i = 0; i < m_u32NumCapsets; i++)
+    {
+        PGPU_VBUFFER vbuf = NULL;
+
+        // Check the return BEFORE dereferencing: on timeout the buffer belongs to the wait machinery and vbuf
+        // is left untouched (NULL here), so reading vbuf->resp_buf would fault.
+        if (!m_CtrlQueue.AskCapsetInfo(&vbuf, i) || vbuf == NULL)
+        {
+            DbgPrint(TRACE_LEVEL_WARNING, ("%s no answer for capset index %lu\n", __FUNCTION__, i));
+            continue;
+        }
+
+        PGPU_RESP_CAPSET_INFO resp = (PGPU_RESP_CAPSET_INFO)vbuf->resp_buf;
+        if (resp != NULL && resp->hdr.type == VIRTIO_GPU_RESP_OK_CAPSET_INFO && resp->capset_id > 0 &&
+            resp->capset_id <= VIRTIO_GPU_CAPSET_MAX_ID)
+        {
+            mask |= 1ull << resp->capset_id;
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s capset[%lu]: id=%lu max_version=%lu max_size=%lu\n",
+                      __FUNCTION__,
+                      i,
+                      resp->capset_id,
+                      resp->capset_max_version,
+                      resp->capset_max_size));
+        }
+        else
+        {
+            DbgPrint(TRACE_LEVEL_WARNING,
+                     ("%s capset index %lu: unusable response (type=0x%X id=%lu)\n",
+                      __FUNCTION__,
+                      i,
+                      resp ? resp->hdr.type : 0,
+                      resp ? resp->capset_id : 0));
+        }
+
+        m_CtrlQueue.ReleaseBuffer(vbuf);
+    }
+
+    const ULONG virgl = (mask & (1ull << VIRTIO_GPU_CAPSET_VIRGL)) ? 1 : 0;
+    const ULONG virgl2 = (mask & (1ull << VIRTIO_GPU_CAPSET_VIRGL2)) ? 1 : 0;
+    const ULONG venus = (mask & (1ull << VIRTIO_GPU_CAPSET_VENUS)) ? 1 : 0;
+    const ULONG ctxInit = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_CONTEXT_INIT) ? 1 : 0;
+
+    //
+    // Venus needs BOTH the capset and per-context capset selection: without CONTEXT_INIT there is no way to
+    // ask for a Venus context, so the capset alone would be unreachable.
+    //
+    const ULONG venusEligible = (venus && ctxInit) ? 1 : 0;
+
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s capset mask=0x%I64x virgl=%lu virgl2=%lu venus=%lu -> Venus eligible=%lu\n",
+              __FUNCTION__,
+              mask,
+              virgl,
+              virgl2,
+              venus,
+              venusEligible));
+
+    PCUNICODE_STRING pPath = m_pVioGpuDod->GetDeviceRegistryPath();
+    if (pPath == NULL || pPath->Length == 0)
+    {
+        return;
+    }
+
+    OBJECT_ATTRIBUTES attr;
+    HANDLE hKey = NULL;
+
+    InitializeObjectAttributes(&attr,
+                               const_cast<PUNICODE_STRING>(pPath),
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL,
+                               NULL);
+
+    if (!NT_SUCCESS(ZwOpenKey(&hKey, KEY_SET_VALUE, &attr)))
+    {
+        return;
+    }
+
+    // Split in two DWORDs: capset ids run to 63, so the mask does not fit one.
+    ProbeWriteDword(hKey, L"HostCapsetMaskLo", (ULONG)(mask & 0xFFFFFFFF));
+    ProbeWriteDword(hKey, L"HostCapsetMaskHi", (ULONG)(mask >> 32));
+    ProbeWriteDword(hKey, L"HostCapsetVirgl", virgl);
+    ProbeWriteDword(hKey, L"HostCapsetVirgl2", virgl2);
+    ProbeWriteDword(hKey, L"HostCapsetVenus", venus);
+    ProbeWriteDword(hKey, L"HostVenusEligible", venusEligible);
+
+    ZwClose(hKey);
 }
 
 NTSTATUS VioGpuAdapter::VirtIoDeviceInit()
@@ -2945,6 +3130,13 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)(&m_pWorkThread), NULL);
 
     ZwClose(threadHandle);
+
+    //
+    // Capset enumeration must live HERE, not next to the feature probe: it needs a control-queue round trip,
+    // and the queue only becomes usable once the device is ready AND SetGpuBuf has handed it a command pool --
+    // both of which happen after VioGpuAdapterInit returns.
+    //
+    RecordHostCapsets();
 
     status = BuildModeList(pDispInfo);
     if (!NT_SUCCESS(status))
