@@ -489,6 +489,50 @@ NTSTATUS VioGpuDod::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQuery
 
     switch (pQueryAdapterInfo->Type)
     {
+        case DXGKQAITYPE_UMDRIVERPRIVATE:
+            {
+                //
+                // The first thing a user-mode driver asks, and the stand-in for what Mesa learns on Linux from
+                // GETPARAM: is there 3D here at all, is there a host-visible window, and which capsets exist.
+                //
+                // The IamVioGpu tag matters more than it looks. Any driver can be handed this query, so a
+                // user-mode driver has to be able to tell ours from someone else's before trusting the rest of
+                // the structure - and refuse rather than misread it.
+                //
+                if (pQueryAdapterInfo->OutputDataSize < sizeof(VIOGPU_ADAPTERINFO))
+                {
+                    DbgPrint(TRACE_LEVEL_WARNING,
+                             ("%s UMDRIVERPRIVATE buffer is %u bytes, need %Iu\n",
+                              __FUNCTION__,
+                              pQueryAdapterInfo->OutputDataSize,
+                              sizeof(VIOGPU_ADAPTERINFO)));
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                VioGpuAdapter *pAdapter = GetHWDevice();
+                if (pAdapter == NULL)
+                {
+                    return STATUS_UNSUCCESSFUL;
+                }
+
+                PVIOGPU_ADAPTERINFO pInfo = reinterpret_cast<PVIOGPU_ADAPTERINFO>(pQueryAdapterInfo->pOutputData);
+                RtlZeroMemory(pInfo, sizeof(VIOGPU_ADAPTERINFO));
+
+                pInfo->IamVioGpu = VIOGPU_IAM;
+                pInfo->SupportedCapsetIds = pAdapter->GetCapsetMask();
+                pInfo->Flags.Supports3d = (pInfo->SupportedCapsetIds != 0) ? 1 : 0;
+                pInfo->Flags.HasShmem = pAdapter->HasHostVisibleWindow() ? 1 : 0;
+                // AdapterLuid stays zero on purpose: the client takes its LUID from its own
+                // D3DKMTOpenAdapter and never reads this field. Filling it would mean inventing a value.
+
+                DbgPrint(TRACE_LEVEL_FATAL,
+                         ("%s UMDRIVERPRIVATE: 3d=%u shmem=%u capsets=0x%I64x\n",
+                          __FUNCTION__,
+                          pInfo->Flags.Supports3d,
+                          pInfo->Flags.HasShmem,
+                          pInfo->SupportedCapsetIds));
+                return STATUS_SUCCESS;
+            }
         case DXGKQAITYPE_DRIVERCAPS:
             {
                 if (!pQueryAdapterInfo->OutputDataSize)
@@ -2553,6 +2597,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_u64GuestFeatures = 0;
     m_u32NumCapsets = 0;
     m_bVenusEligible = FALSE;
+    m_CapsetMask = 0;
+    m_NextCtxId = 0;
     m_bHostVirgl = FALSE;
     m_VenusNextResId = 0x40000000;
     m_HostVisibleBar = 0;
@@ -3433,6 +3479,7 @@ VOID VioGpuAdapter::RecordHostCapsets(void)
     //
     const ULONG venusEligible = (venus && ctxInit) ? 1 : 0;
     m_bVenusEligible = venusEligible ? TRUE : FALSE;
+    m_CapsetMask = mask;   // what CTX_INIT validates a requested capset against
 
     DbgPrint(TRACE_LEVEL_FATAL,
              ("%s capset mask=0x%I64x virgl=%lu virgl2=%lu venus=%lu -> Venus eligible=%lu\n",
@@ -4278,6 +4325,139 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
     return status;
 }
 
+//
+// DRM_IOCTL_VIRTGPU_GET_CAPS. Same shape as the ioctl: an id, a version, and a user buffer to fill.
+//
+// The capset payload is what a guest Vulkan driver checks before it will talk at all -- wire format version
+// first -- so a short buffer is an error rather than something to truncate silently.
+//
+NTSTATUS VioGpuAdapter::EscapeGetCaps(PVIOGPU_CAPSET_REQ pReq)
+{
+    PAGED_CODE();
+
+    PVOID pUser = VIOGPU_UM_PTR_AS(PVOID, pReq->Capset);
+    if (pUser == NULL || pReq->Size == 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PGPU_VBUFFER vbuf = NULL;
+    if (!m_CtrlQueue.AskCapset(&vbuf, pReq->CapsetId, pReq->Version, pReq->Size) || vbuf == NULL)
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    PGPU_RESP_CAPSET resp = (PGPU_RESP_CAPSET)vbuf->resp_buf;
+
+    if (resp != NULL && resp->hdr.type == VIRTIO_GPU_RESP_OK_CAPSET)
+    {
+        // The escape runs in the caller's context at PASSIVE_LEVEL, but the buffer is still user memory: a bad
+        // pointer must fail the call, not the machine.
+        __try
+        {
+            ProbeForWrite(pUser, pReq->Size, sizeof(UCHAR));
+            RtlCopyMemory(pUser, resp->capset_data, pReq->Size);
+            status = STATUS_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = GetExceptionCode();
+        }
+    }
+
+    m_CtrlQueue.ReleaseBuffer(vbuf);
+    return status;
+}
+
+//
+// No ioctl stands behind this one: on Linux the same information comes from sysfs through drmGetDevice, and
+// Mesa uses it to match the adapter to a PCI device.
+//
+NTSTATUS VioGpuAdapter::EscapeGetPciInfo(PVIOGPU_PCI_INFO_REQ pReq)
+{
+    PAGED_CODE();
+
+    DEVICE_OBJECT *pPdo = m_pVioGpuDod->GetPhysicalDeviceObject();
+    if (pPdo == NULL)
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    ULONG bus = 0;
+    ULONG address = 0;
+    ULONG len = 0;
+
+    if (!NT_SUCCESS(IoGetDeviceProperty(pPdo, DevicePropertyBusNumber, sizeof(bus), &bus, &len)) ||
+        !NT_SUCCESS(IoGetDeviceProperty(pPdo, DevicePropertyAddress, sizeof(address), &address, &len)))
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    // DevicePropertyAddress packs the slot in the high word and the function in the low one. The domain is
+    // always 0 here: a QEMU guest has a single PCI segment.
+    pReq->Domain = 0;
+    pReq->Bus = bus;
+    pReq->Dev = (address >> 16) & 0xFFFF;
+    pReq->Func = address & 0xFFFF;
+
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s reporting %04lx:%02lx:%02lx.%lu\n", __FUNCTION__, pReq->Domain, pReq->Bus, pReq->Dev, pReq->Func));
+    return STATUS_SUCCESS;
+}
+
+//
+// DRM_IOCTL_VIRTGPU_CONTEXT_INIT, whose params are CAPSET_ID, NUM_RINGS and POLL_RINGS_MASK.
+//
+// Only the capset reaches the host, exactly as on Linux: context_init carries it in its low bits and nothing
+// else. NumRings is a guest-side count -- Mesa asks for 64 - and is validated here rather than forwarded.
+//
+// The context id goes back to the caller because Windows has no equivalent of the per-file context Linux
+// creates implicitly on first use.
+//
+NTSTATUS VioGpuAdapter::EscapeCtxInit(PVIOGPU_CTX_INIT_REQ pReq)
+{
+    PAGED_CODE();
+
+    if (pReq->CapsetId == 0 || pReq->CapsetId > VIRTIO_GPU_CAPSET_MAX_ID)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pReq->NumRings == 0 || pReq->NumRings > VIRTIO_GPU_MAX_RINGS)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ((m_CapsetMask & (1ull << pReq->CapsetId)) == 0)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s capset %lu not offered by this host\n", __FUNCTION__, pReq->CapsetId));
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    const UINT ctxId = (UINT)InterlockedIncrement((volatile LONG *)&m_NextCtxId);
+
+    // Terminate whatever user mode passed before it reaches a string function.
+    CHAR name[sizeof(pReq->DebugName) + 1];
+    RtlCopyMemory(name, pReq->DebugName, sizeof(pReq->DebugName));
+    name[sizeof(pReq->DebugName)] = '\0';
+
+    m_CtrlQueue.CreateCtx(ctxId, pReq->CapsetId, name);
+    pReq->CtxId = ctxId;
+
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s ctx %u capset %lu rings %lu name '%s'\n", __FUNCTION__, ctxId, pReq->CapsetId, pReq->NumRings, name));
+    return STATUS_SUCCESS;
+}
+
+//
+// DRM_IOCTL_VIRTGPU_RESOURCE_INFO: a handle in, the resource behind it out.
+//
+// On Linux the handle is a GEM handle and the answer comes straight from the bo. Here it is a WDDM allocation
+// handle, and dxgkrnl translates it for us -- no private handle table, which Microsoft discourages because one
+// goes stale on fast user switch and hot unplug.
+//
+// The id is reported even before the resource exists on the host, because that is what the caller needs to
+// build its command stream; ResourceCreated says whether the host has heard of it yet.
+//
 NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
 {
     PAGED_CODE();
@@ -4338,6 +4518,33 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 // run, so this remains the one untested part of the transport.
                 //
                 status = VenusSubmitTest();
+                break;
+            }
+        case VIOGPU_GET_CAPS:
+            {
+                if (pVioGpuEscape->DataLength < sizeof(VIOGPU_CAPSET_REQ))
+                {
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                status = EscapeGetCaps(&pVioGpuEscape->Capset);
+                break;
+            }
+        case VIOGPU_GET_PCI_INFO:
+            {
+                if (pVioGpuEscape->DataLength < sizeof(VIOGPU_PCI_INFO_REQ))
+                {
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                status = EscapeGetPciInfo(&pVioGpuEscape->PciInfo);
+                break;
+            }
+        case VIOGPU_CTX_INIT:
+            {
+                if (pVioGpuEscape->DataLength < sizeof(VIOGPU_CTX_INIT_REQ))
+                {
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                status = EscapeCtxInit(&pVioGpuEscape->CtxInit);
                 break;
             }
         case VIOGPU_GET_CUSTOM_RESOLUTION:

@@ -182,9 +182,180 @@ static int VenusSubmitTest(void)
     return NT_SUCCESS(status) ? 0 : 1;
 }
 
+//
+// Talk to the Vulkan ICD directly, without a loader.
+//
+// vulkaninfo needs the Vulkan SDK, and the runtime loader needs installing too - neither is on a bring-up VM
+// with no working display. But a loader does nothing magic: it finds the ICD, negotiates an interface version,
+// asks it for vkCreateInstance, and calls it. That is short enough to do here, and it removes the last reason
+// to install anything in the guest.
+//
+// The Vulkan types are declared inline rather than pulled from the SDK headers, for the same reason. Only the
+// head of VkPhysicalDeviceProperties is described; the rest is left as padding, since the ICD writes the whole
+// structure and we read the fields we name.
+//
+typedef int VkResult;
+typedef void *VkInstance;
+typedef void *VkPhysicalDevice;
+
+#define VK_STRUCTURE_TYPE_APPLICATION_INFO     0
+#define VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO 1
+#define VK_MAKE_API_VERSION(v, ma, mi, pa)     ((((UINT32)(v)) << 29) | (((UINT32)(ma)) << 22) | (((UINT32)(mi)) << 12) | ((UINT32)(pa)))
+
+typedef struct
+{
+    UINT32 sType;
+    const void *pNext;
+    const char *pApplicationName;
+    UINT32 applicationVersion;
+    const char *pEngineName;
+    UINT32 engineVersion;
+    UINT32 apiVersion;
+} VkApplicationInfoLite;
+
+typedef struct
+{
+    UINT32 sType;
+    const void *pNext;
+    UINT32 flags;
+    const VkApplicationInfoLite *pApplicationInfo;
+    UINT32 enabledLayerCount;
+    const char *const *ppEnabledLayerNames;
+    UINT32 enabledExtensionCount;
+    const char *const *ppEnabledExtensionNames;
+} VkInstanceCreateInfoLite;
+
+typedef struct
+{
+    UINT32 apiVersion;
+    UINT32 driverVersion;
+    UINT32 vendorID;
+    UINT32 deviceID;
+    UINT32 deviceType;
+    char deviceName[256];
+    // pipelineCacheUUID, limits and sparseProperties follow; the caller's buffer covers them.
+} VkPhysicalDevicePropertiesHead;
+
+typedef void *(__stdcall *PFN_vkGetInstanceProcAddr)(VkInstance, const char *);
+typedef VkResult(__stdcall *PFN_vkNegotiate)(UINT32 *);
+typedef VkResult(__stdcall *PFN_vkCreateInstance)(const VkInstanceCreateInfoLite *, const void *, VkInstance *);
+typedef VkResult(__stdcall *PFN_vkEnumeratePhysicalDevices)(VkInstance, UINT32 *, VkPhysicalDevice *);
+typedef void(__stdcall *PFN_vkGetPhysicalDeviceProperties)(VkPhysicalDevice, void *);
+
+static int VenusIcdTest(PCWSTR path)
+{
+    HMODULE icd = LoadLibraryW(path);
+    if (icd == NULL)
+    {
+        PrintMessage(L"LoadLibrary(%ws) failed, error %u\n", path, GetLastError());
+        return 1;
+    }
+    PrintMessage(L"loaded %ws\n", path);
+
+    PFN_vkNegotiate negotiate = (PFN_vkNegotiate)GetProcAddress(icd, "vk_icdNegotiateLoaderICDInterfaceVersion");
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)GetProcAddress(icd, "vk_icdGetInstanceProcAddr");
+
+    if (gipa == NULL)
+    {
+        PrintMessage(L"no vk_icdGetInstanceProcAddr export; this is not a Vulkan ICD\n");
+        return 1;
+    }
+
+    if (negotiate != NULL)
+    {
+        UINT32 version = 5; // what a current loader asks for; the ICD lowers it if it speaks less
+        VkResult r = negotiate(&version);
+        PrintMessage(L"ICD interface negotiated: version %u (result %d)\n", version, r);
+    }
+
+    PFN_vkCreateInstance createInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
+    if (createInstance == NULL)
+    {
+        PrintMessage(L"ICD does not offer vkCreateInstance\n");
+        return 1;
+    }
+
+    VkApplicationInfoLite app = {0};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "viogpuap";
+    app.apiVersion = VK_MAKE_API_VERSION(0, 1, 1, 0);
+
+    VkInstanceCreateInfoLite ci = {0};
+    ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ci.pApplicationInfo = &app;
+
+    VkInstance instance = NULL;
+    VkResult r = createInstance(&ci, NULL, &instance);
+    if (r != 0)
+    {
+        PrintMessage(L"vkCreateInstance failed: %d\n", r);
+        return 1;
+    }
+    PrintMessage(L"vkCreateInstance OK\n");
+
+    PFN_vkEnumeratePhysicalDevices enumerate =
+        (PFN_vkEnumeratePhysicalDevices)gipa(instance, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceProperties getProps =
+        (PFN_vkGetPhysicalDeviceProperties)gipa(instance, "vkGetPhysicalDeviceProperties");
+
+    if (enumerate == NULL)
+    {
+        PrintMessage(L"no vkEnumeratePhysicalDevices\n");
+        return 1;
+    }
+
+    UINT32 count = 0;
+    r = enumerate(instance, &count, NULL);
+    PrintMessage(L"vkEnumeratePhysicalDevices: %u device(s), result %d\n", count, r);
+
+    if (r != 0 || count == 0)
+    {
+        PrintMessage(L"no physical device: the ICD reached the driver but found nothing usable\n");
+        return 1;
+    }
+
+    VkPhysicalDevice devices[8];
+    if (count > 8)
+    {
+        count = 8;
+    }
+    r = enumerate(instance, &count, devices);
+    if (r != 0)
+    {
+        PrintMessage(L"second vkEnumeratePhysicalDevices failed: %d\n", r);
+        return 1;
+    }
+
+    for (UINT32 i = 0; i < count && getProps != NULL; i++)
+    {
+        // Generous buffer: the ICD fills the whole VkPhysicalDeviceProperties, we only name its head.
+        BYTE buffer[2048] = {0};
+        getProps(devices[i], buffer);
+
+        VkPhysicalDevicePropertiesHead *p = (VkPhysicalDevicePropertiesHead *)buffer;
+        PrintMessage(L"device %u: '%hs'\n", i, p->deviceName);
+        PrintMessage(L"  api %u.%u.%u  driver 0x%08X  vendor 0x%04X  device 0x%04X  type %u\n",
+                     (p->apiVersion >> 22) & 0x7F,
+                     (p->apiVersion >> 12) & 0x3FF,
+                     p->apiVersion & 0xFFF,
+                     p->driverVersion,
+                     p->vendorID,
+                     p->deviceID,
+                     p->deviceType);
+    }
+
+    PrintMessage(L"VENUS ICD OK\n");
+    return 0;
+}
+
 int _cdecl wmain(__in ULONG argc, __in_ecount(argc) PWCHAR argv[])
 {
     PrintMessage(L"viogpuap.exe built on %ws %ws\n", _CRT_WIDE(__DATE__), _CRT_WIDE(__TIME__));
+
+    if (argc >= 2 && _wcsicmp(argv[1], L"venusicd") == 0)
+    {
+        return VenusIcdTest(argc >= 3 ? argv[2] : L"vulkan_virtio.dll");
+    }
 
     if (argc == 2 && _wcsicmp(argv[1], L"venustest") == 0)
     {

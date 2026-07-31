@@ -104,6 +104,19 @@ class VioGpuAdapter : IVioGpuPCI
     NTSTATUS VenusMapForUser(PVIOGPU_VENUS_MAPPING pOut);
     NTSTATUS VenusUnmapForUser(void);
     NTSTATUS VenusSubmitTest(void);
+    // The 3D escape ABI, each the Windows transposition of a DRM virtgpu ioctl (see viogpum.h). These are
+    // adapter-level and need nothing from a render model, which is why they work here too.
+    NTSTATUS EscapeGetCaps(PVIOGPU_CAPSET_REQ pReq);
+    NTSTATUS EscapeGetPciInfo(PVIOGPU_PCI_INFO_REQ pReq);
+    NTSTATUS EscapeCtxInit(PVIOGPU_CTX_INIT_REQ pReq);
+    ULONGLONG GetCapsetMask(void)
+    {
+        return m_CapsetMask;
+    }
+    BOOLEAN HasHostVisibleWindow(void)
+    {
+        return m_HostVisibleLen != 0;
+    }
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMATION *pDispInfo);
     void TriggerInitialScan(void);   // called by VioGpuDod::CommitVidPn on the first boot topology (one-shot)
     NTSTATUS HWClose(void);
@@ -241,6 +254,8 @@ class VioGpuAdapter : IVioGpuPCI
     ULONG m_HostVisibleBar;
     ULONGLONG m_HostVisibleOffset;
     ULONGLONG m_HostVisibleLen;
+    ULONGLONG m_CapsetMask;    // bit N set = capset id N offered by this host
+    volatile LONG m_NextCtxId; // virtio context ids handed out by CTX_INIT; never reused
     // Single Venus bring-up mapping session (not a resource manager: one at a time, by design).
     UINT m_VenusTestCtxId;
     UINT m_VenusTestResId;
@@ -472,6 +487,16 @@ class VioGpuDod
     PDXGKRNL_INTERFACE GetDxgkInterface(void)
     {
         return &m_DxgkInterface;
+    }
+    // The escapes reach the virtio queues through the adapter.
+    VioGpuAdapter *GetHWDevice(void)
+    {
+        return m_pHWDevice;
+    }
+    // Needed to read the PCI bus/slot for GET_PCI_INFO; nothing in the Dxgk interface carries them.
+    DEVICE_OBJECT *GetPhysicalDeviceObject(void)
+    {
+        return m_pPhysicalDevice;
     }
 
   private:
