@@ -2762,7 +2762,20 @@ NTSTATUS VioGpuAdapter::SetPowerState(DXGK_DEVICE_INFO *pDeviceInfo,
         case PowerDeviceD2:
         case PowerDeviceD3:
             {
-                DestroyFrameBufferObj(TRUE, FALSE, 0);
+                //
+                // EVERY head, not just the first. Windows drops the device to D3 before stopping it, so this is
+                // the path a live driver replacement takes -- and VioGpuAdapterClose below resets the virtio
+                // device. Leaving head 1 attached means resetting while the host still scans it out.
+                //
+                // On a plain virtio-vga host that goes unnoticed: the scanout is a software surface, so a stale
+                // one costs nothing. On a virgl host it is a GL texture, and QEMU meets the stale scanout with
+                // assert(tex_id) in dbus_scanout_texture -- it aborts instead of reporting an error. The
+                // destructor already loops like this; only this path did not.
+                //
+                for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+                {
+                    DestroyFrameBufferObj(TRUE, FALSE, scan);
+                }
                 VioGpuAdapterClose();
                 pCurrentMode->Flags.FrameBufferIsActive = FALSE;
                 pCurrentMode->FrameBuffer = NULL;
@@ -4319,18 +4332,12 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
         case VIOGPU_VENUS_SUBMIT:
             {
                 //
-                // Disabled, and not because the test was wrong twice.
+                // Re-enabled. It was disabled while SUBMIT_3D was the prime suspect for the host aborting, and
+                // it was never guilty: the abort was a QEMU dbus-listener assert on the driver-replacement
+                // path, which fired with the submit code unreachable too. Submission has still never actually
+                // run, so this remains the one untested part of the transport.
                 //
-                // Any SUBMIT_3D on this host makes a LATER scanout lose its texture: QEMU dies on
-                // dbus_scanout_texture's assert(tex_id), which is the scanout path, not the submit path. The
-                // submit itself is never reported as failing. It happened with a Venus context and again with a
-                // virgl2 one, so it is not about the capset or the payload.
-                //
-                // That is a real interaction, not a test artefact: Mesa will create contexts and submit on them,
-                // and whatever our scanout resource loses when it happens has to be understood first. Leaving a
-                // switch that reliably kills the host would only invite someone to pull it.
-                //
-                status = STATUS_NOT_SUPPORTED;
+                status = VenusSubmitTest();
                 break;
             }
         case VIOGPU_GET_CUSTOM_RESOLUTION:
@@ -5160,14 +5167,25 @@ PAGED_CODE_SEG_END
 
 BOOLEAN VioGpuAdapter::ResetToVgaMode(void)
 {
-    DestroyFrameBufferObj(TRUE, TRUE, 0);
+    // Same reasoning as the D3 path: detach every head before the device is reset, or the host keeps scanning
+    // out a resource that is about to vanish. bKeepBuffer stays TRUE throughout — this runs on the bugcheck
+    // path, possibly above DISPATCH_LEVEL, where DestroyFrameBufferObj must not take the guarded mutex.
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        DestroyFrameBufferObj(TRUE, TRUE, scan);
+    }
     VioGpuAdapterClose();
     return TRUE;
 }
 
 void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s scan %d\n", __FUNCTION__, scanId));
+    DbgPrint(TRACE_LEVEL_VERBOSE,
+             ("---> %s scan %u attached=%u keep=%u\n",
+              __FUNCTION__,
+              scanId,
+              m_pFrameBuf[scanId] != NULL ? 1u : 0u,
+              bKeepBuffer ? 1u : 0u));
     UINT resid = 0;
     UNREFERENCED_PARAMETER(bReset);   // the scanout is now always detached before destroy (below); bReset no longer gates it
 
@@ -5237,6 +5255,11 @@ void VioGpuAdapter::VioGpuAdapterClose()
 
     if (m_pVioGpuDod->IsHardwareInit())
     {
+        // A synchronous drain used to sit here, to make sure the host had consumed the queued SET_SCANOUT(0)
+        // and RESOURCE_UNREF before the reset. It was written to chase a crash that turned out to be elsewhere,
+        // and it guards nothing: QEMU's own reset destroys every resource and disables every scanout, so a
+        // teardown command lost to the reset changes no outcome. Removed rather than kept "just in case" - it
+        // cost a blocking round trip on every device close.
         m_pVioGpuDod->SetHardwareInit(FALSE);
         m_CtrlQueue.DisableInterrupt();
         m_CursorQueue.DisableInterrupt();
@@ -5569,7 +5592,22 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
             // No switch to set: we already know we are on a virgl host, since that is exactly the condition
             // that disabled blob scanout a moment ago.
             //
-            m_CtrlQueue.CreateResource3D(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0);
+            if (!m_CtrlQueue.CreateResource3D(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0))
+            {
+                //
+                // Bail out rather than carry on. Pointing a scanout at a resource the host does not have is not
+                // a recoverable guest error there: QEMU aborts on the missing texture. A head that stays dark
+                // is recoverable; a dead hypervisor is not.
+                //
+                DbgPrint(TRACE_LEVEL_FATAL,
+                         ("%s scan %u: resource %u was not created, refusing to scan it out\n",
+                          __FUNCTION__,
+                          scanId,
+                          resid));
+                delete obj;
+                KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
+                return FALSE;
+            }
         }
         else
         {

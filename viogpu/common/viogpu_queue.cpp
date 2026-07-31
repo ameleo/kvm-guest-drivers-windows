@@ -503,13 +503,25 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_ve
 // virgl_cmd_create_resource_2d hardcodes VIRGL_RESOURCE_Y_0_TOP, so this is the only lever a guest has over
 // scanout orientation on a virgl host.
 //
-void CtrlQueue::CreateResource3D(UINT res_id, UINT format, UINT width, UINT height, UINT flags)
+//
+// Synchronous on purpose, unlike its CREATE_2D sibling.
+//
+// On a virgl host a SET_SCANOUT naming a resource that does not exist is not an error the guest can recover
+// from later: QEMU looks the resource up, gets no texture back, and dies on assert(tex_id) in
+// dbus_scanout_texture. So the creation has to be CONFIRMED before anything points a scanout at it. One
+// round trip per mode set is nothing next to aborting the host.
+//
+BOOLEAN CtrlQueue::CreateResource3D(UINT res_id, UINT format, UINT width, UINT height, UINT flags)
 {
     PAGED_CODE();
 
     PGPU_RES_CREATE_3D cmd;
     PGPU_VBUFFER vbuf;
     cmd = (PGPU_RES_CREATE_3D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
     cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
@@ -525,7 +537,39 @@ void CtrlQueue::CreateResource3D(UINT res_id, UINT format, UINT width, UINT heig
     cmd->nr_samples = 0;
     cmd->flags = flags;
 
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
     QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> CREATE_3D res %u timed out\n", res_id));
+        return FALSE;
+    }
+
+    BOOLEAN ok = FALSE;
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+    if (resp != NULL && resp->type == VIRTIO_GPU_RESP_OK_NODATA)
+    {
+        ok = TRUE;
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("---> CREATE_3D REFUSED res=%u fmt=%u %ux%u flags=0x%x -> resp=0x%X\n",
+                  res_id,
+                  format,
+                  width,
+                  height,
+                  flags,
+                  resp ? resp->type : 0));
+    }
+
+    ReleaseBuffer(vbuf);
+    return ok;
 }
 
 //
