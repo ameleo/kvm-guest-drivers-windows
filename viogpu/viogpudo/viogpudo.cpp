@@ -1928,7 +1928,9 @@ NTSTATUS VioGpuDod::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourc
             pCurrentMode->Rotation = pPath->ContentTransformation.Rotation;
             pCurrentMode->DispInfo.Width = reqW;
             pCurrentMode->DispInfo.Height = reqH;
-            pCurrentMode->DispInfo.Pitch = reqW * BPPFromPixelFormat(pCurrentMode->DispInfo.ColorFormat) / BITS_PER_BYTE;
+            // The mode's own stride (see SetVideoModeInfo): the blit into the framebuffer, the blackout and the blob
+            // resource must all use the same one.
+            pCurrentMode->DispInfo.Pitch = pModeInfo->ScreenStride;
             pCurrentMode->Flags.FullscreenPresent = TRUE;
             Status = m_pHWDevice->SetCurrentMode(m_pHWDevice->GetModeNumber(ModeIndex), pCurrentMode, scanId);
             if (NT_SUCCESS(Status))
@@ -3002,14 +3004,16 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     UINT req_size = pDispInfo->Pitch * pDispInfo->Height;
     req_size = max(req_size, 0x1000000);
 
-    UINT max_res_size = MIN_WIDTH_SIZE * MIN_HEIGHT_SIZE;
+    // In bytes, with each mode's real stride: on the blob path rows are padded (see SetVideoModeInfo), so
+    // width * height * 4 would undersize the segment.
+    UINT max_res_size = MIN_WIDTH_SIZE * MIN_HEIGHT_SIZE * 4;
     for (UINT idx = 0; idx < m_ModeCount; idx++)
     {
-        UINT res_size = m_ModeInfo[idx].VisScreenWidth * m_ModeInfo[idx].VisScreenHeight;
+        UINT res_size = m_ModeInfo[idx].ScreenStride * m_ModeInfo[idx].VisScreenHeight;
         max_res_size = max(max_res_size, res_size);
     }
 
-    req_size = max(req_size, (max_res_size * 4));
+    req_size = max(req_size, max_res_size);
 
     // Blob MEM_GUEST needs guest RAM pages (udmabuf cannot wrap the PCI BAR MMIO): scanout 0 must NOT use the
     // physical BAR — force system memory (IsUsePhysicalMemory()==FALSE below then zeroes fb_pa). Flat guest RAM,
@@ -4304,7 +4308,14 @@ void VioGpuAdapter::SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo)
     pMode->ModeIndex = Idx;
     pMode->VisScreenWidth = pModeInfo->XResolution;
     pMode->VisScreenHeight = pModeInfo->YResolution;
-    pMode->ScreenStride = (pModeInfo->XResolution * 4 + 3) & ~0x3;
+    // Blob scanout: rows aligned to 256 bytes, the strictest pitch alignment GPUs ask of a linear buffer they
+    // import (Intel wants 64, recent AMD and NVIDIA 256). Otherwise the host encoder cannot import the dmabuf
+    // and copies every frame: a browser window gives any width (1716 * 4 is not even a multiple of 64). The
+    // stride is passed in SET_SCANOUT_BLOB, so the host reads the padding as nothing more than the end of each
+    // row. The 2D path keeps width * 4: TRANSFER_TO_HOST_2D assumes the guest backing has the resource's own
+    // pitch.
+    const ULONG rowBytes = pModeInfo->XResolution * 4;
+    pMode->ScreenStride = m_bBlobSupported ? ((rowBytes + 255) & ~255UL) : ((rowBytes + 3) & ~3UL);
 }
 
 NTSTATUS VioGpuAdapter::UpdateChildStatus(UINT childUid, BOOLEAN connect)
