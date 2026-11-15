@@ -2552,6 +2552,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_Id = g_InstanceId++;
     RtlZeroMemory(m_pFrameBuf, sizeof(m_pFrameBuf));
     m_bBlobSupported = FALSE;
+    m_bHostVirgl = FALSE;
     RtlZeroMemory(m_BlobResidB, sizeof(m_BlobResidB));
     RtlZeroMemory(m_BlobFlip, sizeof(m_BlobFlip));
     for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
@@ -2665,8 +2666,23 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit(DXGK_DISPLAY_INFORMATION *pDispInfo)
 
         // Blob scanout: negotiate only if the host offers it. When absent, m_bBlobSupported stays FALSE and the
         // driver falls back to the classic 2D path (CREATE_2D + ATTACH_BACKING + per-frame TRANSFER_TO_HOST).
-        m_bBlobSupported = AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
-        DbgPrint(TRACE_LEVEL_FATAL, ("%s blob scanout %s\n", __FUNCTION__, m_bBlobSupported ? "ENABLED" : "disabled"));
+        //
+        // A virgl host (a `-gl` device) is the exception, and blob scanout has to be refused there. Every command
+        // goes through virtio_gpu_virgl_process_cmd, whose SET_SCANOUT_BLOB expects a resource backed by
+        // virglrenderer, not the flat guest RAM a MEM_GUEST blob carries: it answers 0x1200 on every present and
+        // the screen never comes up. The 2D path costs a transfer per frame, but it works.
+        //
+        m_bHostVirgl = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_VIRGL) ? TRUE : FALSE;
+        m_bBlobSupported = FALSE;
+        if (!m_bHostVirgl)
+        {
+            m_bBlobSupported = AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
+        }
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s blob scanout %s%s\n",
+                  __FUNCTION__,
+                  m_bBlobSupported ? "ENABLED" : "disabled",
+                  m_bHostVirgl ? " (virgl host: MEM_GUEST scanout unsupported, using the 2D path)" : ""));
 
         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
         if (!NT_SUCCESS(status))
@@ -2698,6 +2714,10 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit(DXGK_DISPLAY_INFORMATION *pDispInfo)
                           sizeof(m_u32NumScanouts));
 
         virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, num_capsets), &m_u32NumCapsets, sizeof(m_u32NumCapsets));
+
+        // Write what the host offers where it can be read from inside the guest (HostFeatureVirgl and so on):
+        // which display path a VM takes depends on it. Changes no behaviour.
+        RecordHostCapabilities();
     } while (0);
     if (status == STATUS_SUCCESS)
     {
@@ -4453,6 +4473,61 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
     if (useLock)
         KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+// Write one DWORD under the device's key, ignoring failures.
+static VOID WriteHostCapability(_In_ HANDLE hKey, _In_ PCWSTR pName, _In_ ULONG Value)
+{
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, pName);
+    ZwSetValueKey(hKey, &name, 0, REG_DWORD, &Value, sizeof(Value));
+}
+
+// Record the features the host OFFERED (not what was negotiated) under the device's registry key.
+VOID VioGpuAdapter::RecordHostCapabilities(void)
+{
+    PAGED_CODE();
+
+    PCUNICODE_STRING pPath = m_pVioGpuDod->GetDeviceRegistryPath();
+    if (pPath == NULL || pPath->Length == 0)
+    {
+        return;
+    }
+
+    const ULONG virgl = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_VIRGL) ? 1 : 0;
+    const ULONG blob = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_RESOURCE_BLOB) ? 1 : 0;
+    const ULONG ctxInit = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_CONTEXT_INIT) ? 1 : 0;
+    const ULONG resUuid = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_RESOURCE_UUID) ? 1 : 0;
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s host caps: virgl=%lu blob=%lu ctx_init=%lu res_uuid=%lu capsets=%lu scanouts=%lu\n",
+              __FUNCTION__,
+              virgl,
+              blob,
+              ctxInit,
+              resUuid,
+              m_u32NumCapsets,
+              m_u32NumScanouts));
+
+    OBJECT_ATTRIBUTES attr;
+    HANDLE hKey = NULL;
+    InitializeObjectAttributes(&attr,
+                               const_cast<PUNICODE_STRING>(pPath),
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL,
+                               NULL);
+    NTSTATUS status = ZwOpenKey(&hKey, KEY_SET_VALUE, &attr);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s cannot open the device key: 0x%X\n", __FUNCTION__, status));
+        return;
+    }
+    WriteHostCapability(hKey, L"HostFeatureVirgl", virgl);
+    WriteHostCapability(hKey, L"HostFeatureResourceBlob", blob);
+    WriteHostCapability(hKey, L"HostFeatureContextInit", ctxInit);
+    WriteHostCapability(hKey, L"HostFeatureResourceUuid", resUuid);
+    WriteHostCapability(hKey, L"HostNumCapsets", m_u32NumCapsets);
+    WriteHostCapability(hKey, L"HostNumScanouts", m_u32NumScanouts);
+    ZwClose(hKey);
 }
 
 void VioGpuAdapter::VioGpuAdapterClose()
