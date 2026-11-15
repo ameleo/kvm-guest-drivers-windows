@@ -195,6 +195,7 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN CreateBlobResource(UINT resid, PSCATTER_GATHER_LIST sgl, UINT nents, ULONGLONG size);
     PGPU_MEM_ENTRY BuildMemEntries(PSCATTER_GATHER_LIST sgl, UINT nents, _Out_ UINT *pCount);
     void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId);
+    VOID RecordHostCapabilities(void);
     BOOLEAN CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     BOOLEAN UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     void DestroyCursor(void);
@@ -223,6 +224,7 @@ class VioGpuAdapter : IVioGpuPCI
     UINT64 m_u64HostFeatures;
     UINT64 m_u64GuestFeatures;
     BOOLEAN m_bBlobSupported;   // VIRTIO_GPU_F_RESOURCE_BLOB negotiated -> blob scanout path (else classic 2D)
+    BOOLEAN m_bHostVirgl;       // host offers VIRGL (`-gl` device): no MEM_GUEST blob scanout
     UINT32 m_u32NumCapsets;
     UINT32 m_u32NumScanouts;
     CtrlQueue m_CtrlQueue;
@@ -324,6 +326,11 @@ class VioGpuDod
     BOOLEAN IsDriverActive() const
     {
         return m_Flags.DriverStarted;
+    }
+    // The device's own registry key, filled by DxgkCbGetDeviceInformation at StartDevice.
+    PCUNICODE_STRING GetDeviceRegistryPath(void) const
+    {
+        return &m_DeviceInfo.DeviceRegistryPath;
     }
     BOOLEAN IsHardwareInit() const
     {
