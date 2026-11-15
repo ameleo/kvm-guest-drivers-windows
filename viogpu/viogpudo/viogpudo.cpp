@@ -3361,14 +3361,20 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     UINT size = pEscape->PrivateDriverDataSize;
-    if (size < sizeof(PVIOGPU_ESCAPE))
+    if (size < FIELD_OFFSET(VIOGPU_ESCAPE, ScanId))
     {
         DbgPrint(TRACE_LEVEL_ERROR,
                  ("%s buffer too small %d, should be at least %d\n",
                   __FUNCTION__,
-                  pEscape->PrivateDriverDataSize,
-                  size));
+                  size,
+                  (UINT)FIELD_OFFSET(VIOGPU_ESCAPE, ScanId)));
         return STATUS_INVALID_BUFFER_SIZE;
+    }
+    // Callers built for a single head do not send ScanId: they address head 0.
+    UINT scanId = (size >= sizeof(VIOGPU_ESCAPE)) ? pVioGpuEscape->ScanId : 0;
+    if (scanId >= GetNumScanouts())
+    {
+        scanId = 0;
     }
 
     switch (pVioGpuEscape->Type)
@@ -3404,7 +3410,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 {
                     // Return the custom resolution of the head the caller asks for
                     // (ScanId == VidPnSourceId, which equals the scanout in practice).
-                    UINT getScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    UINT getScan = scanId;
                     pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenWidth;
                     pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenHeight;
                 }
@@ -3439,7 +3445,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                           pVioGpuEscape->Resolution.YResolution));
 
                 {
-                    UINT setScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    UINT setScan = scanId;
                     // Only the primary head's custom resolution is persisted across boots.
                     if (setScan == 0)
                     {

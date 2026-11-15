@@ -46,11 +46,13 @@ typedef struct _VIOGPU_ESCAPE
 {
     USHORT Type;
     USHORT DataLength;
-    USHORT ScanId; // target head for GET/SET_CUSTOM_RESOLUTION (VidPnSourceId); 0 for GET_DEVICE_ID
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
     } DUMMYUNIONNAME;
+    // Head for GET/SET_CUSTOM_RESOLUTION (VidPnSourceId). Last, so the first fields keep the layout of the
+    // single-head escape: a caller that sends only those gets head 0.
+    USHORT ScanId;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
 #pragma pack()
 
