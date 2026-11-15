@@ -3445,19 +3445,33 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     UINT size = pEscape->PrivateDriverDataSize;
-    if (size < FIELD_OFFSET(VIOGPU_ESCAPE, ScanId))
+    // Two layouts reach this escape. The multi-head one (ScanId at offset 4, the union after it) is at least
+    // sizeof(VIOGPU_ESCAPE); older agents of this fork send a larger union, same offsets. The single-head one
+    // of upstream tools is 8 bytes, the union at offset 4 and no ScanId: it is translated into a local
+    // multi-head request for head 0, and the union copied back to its own offset when done.
+    VIOGPU_ESCAPE singleHeadRequest = {0};
+    PVIOGPU_ESCAPE_SINGLE_HEAD pSingleHead = NULL;
+    if (size < sizeof(VIOGPU_ESCAPE))
     {
-        DbgPrint(TRACE_LEVEL_ERROR,
-                 ("%s buffer too small %d, should be at least %d\n",
-                  __FUNCTION__,
-                  size,
-                  (UINT)FIELD_OFFSET(VIOGPU_ESCAPE, ScanId)));
-        return STATUS_INVALID_BUFFER_SIZE;
+        if (size < sizeof(VIOGPU_ESCAPE_SINGLE_HEAD))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s buffer too small %d, should be at least %d\n",
+                      __FUNCTION__,
+                      size,
+                      (UINT)sizeof(VIOGPU_ESCAPE_SINGLE_HEAD)));
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        pSingleHead = (PVIOGPU_ESCAPE_SINGLE_HEAD)pEscape->pPrivateDriverData;
+        singleHeadRequest.Type = pSingleHead->Type;
+        singleHeadRequest.DataLength = pSingleHead->DataLength;
+        singleHeadRequest.ScanId = 0;
+        singleHeadRequest.Id = pSingleHead->Id;
+        pVioGpuEscape = &singleHeadRequest;
     }
-    // Callers built for a single head do not send ScanId: they address head 0. ScanId is the caller's
-    // VidPnSourceId; the custom resolution belongs to the head (target) that source is shown on.
-    UINT scanId = (size >= sizeof(VIOGPU_ESCAPE)) ? pVioGpuEscape->ScanId : 0;
-    scanId = m_pVioGpuDod->TargetOfSource(scanId);
+    // ScanId is the caller's VidPnSourceId; the custom resolution belongs to the head (target) that source is
+    // shown on.
+    UINT scanId = m_pVioGpuDod->TargetOfSource(pVioGpuEscape->ScanId);
     if (scanId >= GetNumScanouts())
     {
         scanId = 0;
@@ -3549,6 +3563,10 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
             status = STATUS_INVALID_PARAMETER;
     }
 
+    if (pSingleHead != NULL && NT_SUCCESS(status))
+    {
+        pSingleHead->Id = singleHeadRequest.Id; // the answer (device id or resolution) at the caller's offset
+    }
     return status;
 }
 
