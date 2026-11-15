@@ -4643,22 +4643,35 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
     ULONG numScanouts = GetNumScanouts();
     BOOLEAN any = FALSE;
 
+    // One GET_DISPLAY_INFO answers for every head. If it fails (timeout, no buffer, error response), nothing is
+    // known about the heads: leave their sizes and their connection state as they are. Reading a failure as
+    // "every secondary disabled" unplugged live monitors and destroyed their scanouts, a visible flash.
+    PGPU_VBUFFER vbuf = NULL;
+    if (!m_CtrlQueue.AskDisplayInfo(&vbuf))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s: no display info, heads left unchanged\n", __FUNCTION__));
+        return FALSE;
+    }
+    if (((PGPU_RESP_DISP_INFO)vbuf->resp_buf)->hdr.type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--- %s: display info answered %x, heads left unchanged\n",
+                  __FUNCTION__,
+                  ((PGPU_RESP_DISP_INFO)vbuf->resp_buf)->hdr.type));
+        m_CtrlQueue.ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
     // Read EACH scanout's host-preferred resolution into ITS OWN custom slot.
     // Only overwrite a slot when the host actually reports a size for that
     // scanout: clobbering a head that momentarily reports "disabled" with a
     // nominal size would knock it back to 1024x768 on every config change.
     for (UINT32 i = 0; i < numScanouts; i++)
     {
-        PGPU_VBUFFER vbuf = NULL;
         ULONG xres = 0;
         ULONG yres = 0;
-        BOOLEAN ok = FALSE;
-
-        if (m_CtrlQueue.AskDisplayInfo(&vbuf))
-        {
-            ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
-            m_CtrlQueue.ReleaseBuffer(vbuf);
-        }
+        // FALSE here only means this head is disabled: the response itself was checked above.
+        BOOLEAN ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
 
 
         if (ok && xres && yres)
@@ -4715,6 +4728,8 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
             // else: pre-active boot -> keep the HWInit seed (see above); the arrival comes post-start.
         }
     }
+
+    m_CtrlQueue.ReleaseBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return any;
