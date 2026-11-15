@@ -60,6 +60,7 @@ VioGpuDod::VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     KeInitializeDpc(&m_VsyncTimerDpc, VsyncTimerProcGate, this);
     KeInitializeTimer(&m_VsyncTimer);
     m_bVsyncEnabled = FALSE;
+    m_bVsyncPowered = TRUE;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
@@ -259,6 +260,9 @@ NTSTATUS VioGpuDod::StopDevice(VOID)
     PAGED_CODE();
 
     EnableVsync(FALSE);   // stop the simulated-vblank timer before the device goes away
+    // KeCancelTimer does not wait for a timer DPC that is already queued or running, and the device object may be
+    // freed right after this returns: let that DPC finish first.
+    KeFlushQueuedDpcs();
     m_Flags.DriverStarted = FALSE;
     return STATUS_SUCCESS;
 }
@@ -371,8 +375,20 @@ NTSTATUS VioGpuDod::SetPowerState(_In_ ULONG HardwareUid,
             }
             m_AdapterPowerState = DevicePowerState;
         }
+        else
+        {
+            // Close the vsync timer's power gate before the device is reset, and let a timer DPC already past the
+            // gate finish: it must not notify a vblank (and queue the DPC routine) on a powered-down device. The
+            // timer itself keeps running, so vsync resumes on D0 without dxgkrnl re-enabling it.
+            m_bVsyncPowered = FALSE;
+            KeFlushQueuedDpcs();
+        }
 
         Status = m_pHWDevice->SetPowerState(&m_DeviceInfo, DevicePowerState, &m_CurrentMode[0]);
+        if (DevicePowerState == PowerDeviceD0)
+        {
+            m_bVsyncPowered = TRUE; // the device is back up: vblanks may be notified again
+        }
         return Status;
     }
     return STATUS_SUCCESS;
@@ -2255,7 +2271,7 @@ BOOLEAN VioGpuDod::VsyncTimerSynchRoutine(PVOID context)
 VOID VioGpuDod::VsyncTimerProc(void)
 {
     BOOLEAN bDummy = FALSE;
-    if (m_bVsyncEnabled && m_AdapterPowerState == PowerDeviceD0)
+    if (m_bVsyncEnabled && m_bVsyncPowered)
     {
         m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle,
                                                    VsyncTimerSynchRoutine,
