@@ -275,6 +275,10 @@ class VioGpuAdapter : IVioGpuPCI
     VioGpuObj *m_pFrameBuf[MAX_SCANOUTS];
     USHORT m_FrameBufW[MAX_SCANOUTS];   // host resource dimensions per scanout — the Present/BlackOut transfer is
     USHORT m_FrameBufH[MAX_SCANOUTS];   // clamped to these so a stale mode can never overrun the resource (UNSPEC)
+    // The stride and format the scanout's blob resources were created with. A flip must describe the resource
+    // as it is, not the current mode, which can already be ahead of it (0x1205, or a sheared image).
+    ULONG m_FrameBufStride[MAX_SCANOUTS];
+    UINT m_FrameBufFormat[MAX_SCANOUTS];
     // Serialises each scanout's framebuffer object between the present/blackout readers (which deref
     // m_pFrameBuf[scanId]->GetId() and issue the host transfer) and the hotplug/mode/power writers (which
     // delete the object and recycle its resource id). Per-scanout so heads never block each other. Guarded (not
