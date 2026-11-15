@@ -299,6 +299,9 @@ class VioGpuDod
     KTIMER m_VsyncTimer;
     KDPC m_VsyncTimerDpc;
     BOOLEAN m_bVsyncEnabled;
+    // FALSE while the adapter is in a low-power state: the timer keeps running but notifies nothing.
+    // m_AdapterPowerState cannot serve as that gate, it only ever records D0.
+    volatile BOOLEAN m_bVsyncPowered;
 
   public:
     VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject);
