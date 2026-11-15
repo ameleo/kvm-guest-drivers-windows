@@ -78,6 +78,9 @@ class VioGpuAdapter : IVioGpuPCI
     VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod);
     ~VioGpuAdapter(void);
     NTSTATUS SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode, UINT scanId);
+    // Stop scanning out target scanId: detach the scanout and destroy its framebuffer. For a target no source
+    // drives any more (its source was turned off or moved to another target).
+    VOID ReleaseScanout(UINT scanId);
     ULONG GetModeCount(void)
     {
         return m_ModeCount;
@@ -184,6 +187,7 @@ class VioGpuAdapter : IVioGpuPCI
     void SetCustomDisplay(_In_ UINT scanId, _In_ USHORT xres, _In_ USHORT yres);
     BOOLEAN CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode, UINT scanId);
     void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, UINT scanId);
+    UINT CursorScanout(UINT srcId, CONST CURRENT_MODE *pModeCur);
     BOOLEAN CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     BOOLEAN UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     void DestroyCursor(void);
@@ -293,6 +297,16 @@ class VioGpuDod
     BOOLEAN IsHardwareInit() const
     {
         return m_Flags.HardwareInit;
+    }
+    // The target (scanout) a source is committed to, or the source id itself while it has none: sources and
+    // targets only coincide while they map 1:1, which "show only on 2" or a hotplug reorder breaks.
+    UINT TargetOfSource(UINT srcId) const
+    {
+        if (srcId < MAX_VIEWS && m_CurrentMode[srcId].DispInfo.TargetId < MAX_SCANOUTS)
+        {
+            return (UINT)m_CurrentMode[srcId].DispInfo.TargetId;
+        }
+        return srcId;
     }
     void SetHardwareInit(BOOLEAN init)
     {
@@ -419,6 +433,7 @@ class VioGpuDod
     NTSTATUS ReadRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _Inout_ PDWORD pdwValue);
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
                                   CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath);
+    VOID ReleaseOldTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID target, UINT srcId);
     NTSTATUS AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes);
     NTSTATUS AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INTERFACE *pVidPnSourceModeSetInterface,
                                  D3DKMDT_HVIDPNSOURCEMODESET hVidPnSourceModeSet,
