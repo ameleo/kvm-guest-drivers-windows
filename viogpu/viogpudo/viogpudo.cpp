@@ -1734,6 +1734,15 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
     CONST DXGK_VIDPNSOURCEMODESET_INTERFACE *pVidPnSourceModeSetInterface = NULL;
     CONST D3DKMDT_VIDPN_PRESENT_PATH *pVidPnPresentPath = NULL;
     CONST D3DKMDT_VIDPN_SOURCE_MODE *pPinnedVidPnSourceModeInfo = NULL;
+    // The target this source scanned out before the commit. Released below when the source is turned off or
+    // moved to another target, so the old head does not keep showing a frozen last frame.
+    UINT srcId = (UINT)pCommitVidPn->AffectedVidPnSourceId;
+    D3DDDI_VIDEO_PRESENT_TARGET_ID oldTarget = D3DDDI_ID_UNINITIALIZED;
+    if (srcId < MAX_VIEWS && m_CurrentMode[srcId].Flags.FrameBufferIsActive)
+    {
+        oldTarget = m_CurrentMode[srcId].DispInfo.TargetId;
+    }
+    BOOLEAN oldTargetKept = FALSE;
 
     if (pCommitVidPn->Flags.PathPoweredOff)
     {
@@ -1820,6 +1829,14 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
 
     if (pPinnedVidPnSourceModeInfo == NULL)
     {
+        // No pinned mode: the source is being turned off ("PC screen only" for a secondary). Stop presenting
+        // it and release the head it was showing.
+        if (srcId < MAX_VIEWS)
+        {
+            m_CurrentMode[srcId].Flags.FrameBufferIsActive = FALSE;
+            m_CurrentMode[srcId].FrameBuffer = NULL;
+        }
+        ReleaseOldTarget(oldTarget, srcId);
         Status = STATUS_SUCCESS;
         goto CommitVidPnExit;
     }
@@ -1889,6 +1906,10 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
         {
             goto CommitVidPnExit;
         }
+        if (TargetId == oldTarget)
+        {
+            oldTargetKept = TRUE;
+        }
 
         Status = pVidPnTopologyInterface->pfnReleasePathInfo(hVidPnTopology, pVidPnPresentPath);
         if (!NT_SUCCESS(Status))
@@ -1901,6 +1922,12 @@ NTSTATUS VioGpuDod::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVid
             goto CommitVidPnExit;
         }
         pVidPnPresentPath = NULL;
+    }
+
+    // The source now scans out other targets only ("second screen only", or a reordered topology).
+    if (!oldTargetKept)
+    {
+        ReleaseOldTarget(oldTarget, srcId);
     }
 
 CommitVidPnExit:
@@ -1928,6 +1955,28 @@ CommitVidPnExit:
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
     return Status;
+}
+
+// Release target, which source srcId no longer scans out, unless another source already took it over in this
+// same topology change (sources swapping heads): its framebuffer is that source's now.
+VOID VioGpuDod::ReleaseOldTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID target, UINT srcId)
+{
+    PAGED_CODE();
+
+    if (m_pHWDevice == NULL || target >= m_pHWDevice->GetNumScanouts())
+    {
+        return;
+    }
+    for (UINT src = 0; src < MAX_VIEWS; src++)
+    {
+        if (src != srcId && m_CurrentMode[src].Flags.FrameBufferIsActive &&
+            m_CurrentMode[src].DispInfo.TargetId == target)
+        {
+            return;
+        }
+    }
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: source %u left target %u, releasing it\n", __FUNCTION__, srcId, target));
+    m_pHWDevice->ReleaseScanout((UINT)target);
 }
 
 NTSTATUS VioGpuDod::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
@@ -2658,11 +2707,12 @@ NTSTATUS VioGpuAdapter::SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode, U
     {
         if (Mode == m_ModeInfo[idx].ModeIndex /*m_ModeNumbers[idx]*/)
         {
-            if (pCurrentMode->Flags.FrameBufferIsActive)
-            {
-                DestroyFrameBufferObj(FALSE, FALSE, scanId);
-                pCurrentMode->Flags.FrameBufferIsActive = FALSE;
-            }
+            // Framebuffers belong to the TARGET, FrameBufferIsActive to the SOURCE: destroy whatever this target
+            // scans out (this source's previous mode, or another source's that moved away), not only when this
+            // source had one. A no-op when the target has none. The target this source leaves, if it moved, is
+            // released by CommitVidPn.
+            DestroyFrameBufferObj(FALSE, FALSE, scanId);
+            pCurrentMode->Flags.FrameBufferIsActive = FALSE;
             if (CreateFrameBufferObj(&m_ModeInfo[idx], pCurrentMode, scanId))
             {
                 DbgPrint(TRACE_LEVEL_ERROR,
@@ -2678,6 +2728,34 @@ NTSTATUS VioGpuAdapter::SetCurrentMode(ULONG Mode, CURRENT_MODE *pCurrentMode, U
     }
     DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed\n", __FUNCTION__));
     return STATUS_UNSUCCESSFUL;
+}
+
+VOID VioGpuAdapter::ReleaseScanout(UINT scanId)
+{
+    PAGED_CODE();
+
+    if (scanId >= MAX_SCANOUTS)
+    {
+        return;
+    }
+    DestroyFrameBufferObj(TRUE, FALSE, scanId);
+    // No pointer on a head that shows nothing: it must not count as "still showing the pointer" when
+    // SetPointerPosition tells a global hide from a crossing, and the next show re-attaches the sprite.
+    KeAcquireGuardedMutex(&m_CursorMutex);
+    m_bCursorHidden[scanId] = TRUE;
+    KeReleaseGuardedMutex(&m_CursorMutex);
+}
+
+// The scanout a source's pointer goes to: the target the source is committed to. The source id is only the
+// same scanout while sources and targets map 1:1. Until a commit sets it TargetId is D3DDDI_ID_UNINITIALIZED,
+// so fall back to the source id then (an uninitialized TargetId once sent the cursor to a scanout that does not
+// exist).
+UINT VioGpuAdapter::CursorScanout(UINT srcId, CONST CURRENT_MODE *pModeCur)
+{
+    PAGED_CODE();
+
+    UINT target = (UINT)pModeCur->DispInfo.TargetId;
+    return (target < GetNumScanouts()) ? target : srcId;
 }
 
 NTSTATUS VioGpuAdapter::VioGpuAdapterInit(DXGK_DISPLAY_INFORMATION *pDispInfo)
@@ -3526,6 +3604,7 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
     // made Windows fall back to a software cursor composited into the framebuffer.
     if (UpdateCursor(pSetPointerShape, pModeCur))
     {
+        UINT scan = CursorScanout((UINT)pSetPointerShape->VidPnSourceId, pModeCur);
         PGPU_UPDATE_CURSOR crsr;
         PGPU_VBUFFER vbuf;
         UINT ret = 0;
@@ -3534,7 +3613,8 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
 
         crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
         crsr->resource_id = m_pCursorBuf->GetId();
-        crsr->pos.scanout_id = (ULONG)pSetPointerShape->VidPnSourceId; // source id == scanout id
+        // The scanout the source is committed to, not the source id (see CursorScanout).
+        crsr->pos.scanout_id = (ULONG)scan;
         crsr->pos.x = 0;
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
@@ -3543,7 +3623,7 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         // Remember the hot spot for the UPDATE_CURSOR that re-attaches the sprite after a later hide.
         m_CursorHotX = pSetPointerShape->XHot;
         m_CursorHotY = pSetPointerShape->YHot;
-        m_bCursorHidden[pSetPointerShape->VidPnSourceId] = FALSE;
+        m_bCursorHidden[scan] = FALSE;
         ret = m_CursorQueue.QueueCursor(vbuf);
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
@@ -3573,7 +3653,8 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
     KeAcquireGuardedMutex(&m_CursorMutex);
     if (m_pCursorBuf != NULL)
     {
-        UINT src = (UINT)pSetPointerPosition->VidPnSourceId;
+        // The scanout the source is committed to (see CursorScanout). The hidden state is kept per scanout.
+        UINT scan = CursorScanout((UINT)pSetPointerPosition->VidPnSourceId, pModeCur);
         // Out-of-range coordinates are treated as invisible, as before.
         BOOLEAN visible = pSetPointerPosition->Flags.Visible && pSetPointerPosition->X >= 0 &&
                           pSetPointerPosition->Y >= 0 && (UINT)pSetPointerPosition->X <= pModeCur->SrcModeWidth &&
@@ -3587,12 +3668,12 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                   pSetPointerPosition->Flags.Visible,
                   pSetPointerPosition->Flags.Value,
                   pSetPointerPosition->VidPnSourceId,
-                  m_bCursorHidden[src]));
+                  m_bCursorHidden[scan]));
 
         BOOLEAN sendCmd = TRUE;
         if (!visible)
         {
-            if (m_bCursorHidden[src])
+            if (m_bCursorHidden[scan])
             {
                 // Already hidden, nothing to send.
                 sendCmd = FALSE;
@@ -3600,14 +3681,17 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             else
             {
                 // Windows hides a head's pointer for two reasons. In a window move or resize loop every
-                // connected head ends hidden: send the hide, so a remote client can blank its own cursor.
+                // scanned-out head ends hidden: send the hide, so a remote client can blank its own cursor.
                 // When the pointer merely leaves this head for another, some head stays visible: send
                 // nothing, since each head has its own cursor channel and an untagged hide racing the next
                 // head's UPDATE_CURSOR would blank the remote cursor.
-                m_bCursorHidden[src] = TRUE;
+                m_bCursorHidden[scan] = TRUE;
                 for (UINT i = 0; i < GetNumScanouts(); i++)
                 {
-                    if (m_bConnected[i] && !m_bCursorHidden[i])
+                    // A head that is scanned out, not merely connected: a connected head outside the topology
+                    // ("PC screen only") gets no pointer DDIs, so a stale "visible" state there would turn every
+                    // later global hide into a crossing. ReleaseScanout marks a released head hidden.
+                    if (m_pFrameBuf[i] != NULL && !m_bCursorHidden[i])
                     {
                         sendCmd = FALSE;
                         break;
@@ -3627,7 +3711,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             UINT ret = 0;
             crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
             RtlZeroMemory(crsr, sizeof(*crsr));
-            crsr->pos.scanout_id = (ULONG)src;
+            crsr->pos.scanout_id = (ULONG)scan;
 
             if (!visible)
             {
@@ -3636,7 +3720,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                 crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
                 crsr->resource_id = 0;
             }
-            else if (m_bCursorHidden[src])
+            else if (m_bCursorHidden[scan])
             {
                 // Coming back from a hide: MOVE_CURSOR does not re-associate a detached resource, so the
                 // sprite must be re-attached with a full UPDATE_CURSOR. The image itself is still
@@ -3647,7 +3731,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                 crsr->pos.y = pSetPointerPosition->Y;
                 crsr->hot_x = m_CursorHotX;
                 crsr->hot_y = m_CursorHotY;
-                m_bCursorHidden[src] = FALSE;
+                m_bCursorHidden[scan] = FALSE;
             }
             else
             {
@@ -3739,9 +3823,13 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_BUFFER_SIZE;
                 }
                 {
-                    // Return the custom resolution of the head the caller asks for
-                    // (ScanId == VidPnSourceId, which equals the scanout in practice).
-                    UINT getScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    // ScanId is the caller's VidPnSourceId. The custom resolution belongs to the head (target) that
+                    // source is shown on.
+                    UINT getScan = m_pVioGpuDod->TargetOfSource((UINT)pVioGpuEscape->ScanId);
+                    if (getScan >= GetNumScanouts())
+                    {
+                        getScan = 0;
+                    }
                     pVioGpuEscape->Resolution.XResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenWidth;
                     pVioGpuEscape->Resolution.YResolution = (USHORT)m_ModeInfo[m_CustomModeIndex[getScan]].VisScreenHeight;
                 }
@@ -3776,7 +3864,12 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                           pVioGpuEscape->Resolution.YResolution));
 
                 {
-                    UINT setScan = (pVioGpuEscape->ScanId < GetNumScanouts()) ? (UINT)pVioGpuEscape->ScanId : 0;
+                    // Same source-to-target mapping as VIOGPU_GET_CUSTOM_RESOLUTION.
+                    UINT setScan = m_pVioGpuDod->TargetOfSource((UINT)pVioGpuEscape->ScanId);
+                    if (setScan >= GetNumScanouts())
+                    {
+                        setScan = 0;
+                    }
                     // Only the primary head's custom resolution is persisted across boots.
                     if (setScan == 0)
                     {
@@ -3889,7 +3982,7 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
                     // surface -> the server's capture skips it -> RTP goes silent (no frozen heartbeat for a head
                     // that is gone). On reconnect, CreateFrameBufferObj sets a fresh scanout. Present to this head
                     // is guarded (m_pFrameBuf[i] == NULL -> no-op).
-                    DestroyFrameBufferObj(TRUE, FALSE, i);
+                    ReleaseScanout(i);
                 }
             }
             // else: pre-active boot -> keep the HWInit seed (see above); the arrival comes post-start.
