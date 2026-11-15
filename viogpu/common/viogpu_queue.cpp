@@ -1454,7 +1454,14 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
             // Allocating through MmAllocatePagesForMdlEx also guarantees no aliasing cached mapping exists.
             PHYSICAL_ADDRESS low = {0}, high = {0}, skip = {0};
             high.QuadPart = -1LL;
-            m_pMdl = MmAllocatePagesForMdlEx(low, high, skip, size, MmWriteCombined, MM_ALLOCATE_FULLY_REQUIRED);
+            // PREFER_CONTIGUOUS: long physical runs keep a blob's mem-entry list short (QEMU refuses more than
+            // 16384 entries). Only a preference, so a fragmented guest still gets its pages.
+            m_pMdl = MmAllocatePagesForMdlEx(low,
+                                             high,
+                                             skip,
+                                             size,
+                                             MmWriteCombined,
+                                             MM_ALLOCATE_FULLY_REQUIRED | MM_ALLOCATE_PREFER_CONTIGUOUS);
             if (!m_pMdl)
             {
                 DbgPrint(TRACE_LEVEL_FATAL, ("%s failed to allocate %x bytes of WC pages\n", __FUNCTION__, size));
