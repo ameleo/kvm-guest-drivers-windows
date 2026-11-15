@@ -2542,6 +2542,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     RtlZeroMemory(m_bEDID, sizeof(m_bEDID));
     RtlZeroMemory(m_bConnected, sizeof(m_bConnected));
     RtlZeroMemory(m_FrameBufW, sizeof(m_FrameBufW));
+    RtlZeroMemory(m_FrameBufStride, sizeof(m_FrameBufStride));
+    RtlZeroMemory(m_FrameBufFormat, sizeof(m_FrameBufFormat));
     RtlZeroMemory(m_FrameBufH, sizeof(m_FrameBufH));
     m_ModeInfo = NULL;
     m_ModeCount = 0;
@@ -3291,8 +3293,8 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
             // the same guest pages written in place, so the flipped-to one already shows the BltBits output.
             m_BlobFlip[scanId] ^= 1u;
             UINT nextResid = m_BlobFlip[scanId] ? m_BlobResidB[scanId] : (UINT)m_pFrameBuf[scanId]->GetId();
-            m_CtrlQueue.SetScanoutBlob(scanId, nextResid, ColorFormat(pModeCur->DispInfo.ColorFormat),
-                                       m_FrameBufW[scanId], m_FrameBufH[scanId], pModeCur->DispInfo.Pitch);
+            m_CtrlQueue.SetScanoutBlob(scanId, nextResid, m_FrameBufFormat[scanId],
+                                       m_FrameBufW[scanId], m_FrameBufH[scanId], m_FrameBufStride[scanId]);
         }
     }
     else
@@ -3349,8 +3351,8 @@ VOID VioGpuAdapter::BlackOutScreen(CURRENT_MODE *pCurrentMod)
                 // get rejected (resp=0x1205 INVALID_PARAMETER on cmd 0x104), wedging the control queue ("Failed to
                 // ask display info") -> driver crash. The memset above already blacked the shared pages; a flip
                 // (SET_SCANOUT_BLOB on resource A) propagates it via the dmabuf scanout path.
-                m_CtrlQueue.SetScanoutBlob(scanId, resid, ColorFormat(pCurrentMod->DispInfo.ColorFormat),
-                                           m_FrameBufW[scanId], m_FrameBufH[scanId], pCurrentMod->DispInfo.Pitch);
+                m_CtrlQueue.SetScanoutBlob(scanId, resid, m_FrameBufFormat[scanId],
+                                           m_FrameBufW[scanId], m_FrameBufH[scanId], m_FrameBufStride[scanId]);
                 m_BlobFlip[scanId] = 0;   // keep the flip state in sync: A is now the scanned-out resource
             }
             else
@@ -4505,6 +4507,8 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
         m_pFrameBuf[scanId] = NULL;
         m_FrameBufW[scanId] = 0;   // no resource → the present/blackout guard skips transfers on this scanout
         m_FrameBufH[scanId] = 0;
+        m_FrameBufStride[scanId] = 0;
+        m_FrameBufFormat[scanId] = 0;
         m_Idr.PutId(resid);
     }
     if (useLock)
@@ -4875,6 +4879,8 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     m_pFrameBuf[scanId] = obj;
     m_FrameBufW[scanId] = (USHORT)pModeInfo->VisScreenWidth;    // the host resource size — transfers clamp to this
     m_FrameBufH[scanId] = (USHORT)pModeInfo->VisScreenHeight;
+    m_FrameBufStride[scanId] = pModeInfo->ScreenStride;
+    m_FrameBufFormat[scanId] = format;
     pCurrentMode->FrameBuffer = obj->GetVirtualAddress();
     pCurrentMode->Flags.FrameBufferIsActive = TRUE;
     KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
