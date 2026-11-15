@@ -299,9 +299,17 @@ void GpuAdapter::SyncResolution(void)
     // re-query the current config and change only our own path keeps the other
     // head stable when both instances update concurrently.
     HANDLE hLock = CreateMutex(NULL, FALSE, L"VioGpuResizeLock");
+    BOOL owned = FALSE;
     if (hLock)
     {
-        WaitForSingleObject(hLock, 5000);
+        // WAIT_ABANDONED also hands us the mutex (its previous owner died). On a timeout we go on unserialized,
+        // as before, but must not release a mutex we do not own.
+        DWORD wait = WaitForSingleObject(hLock, 5000);
+        owned = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
+        if (!owned)
+        {
+            PrintMessage(L"%ws: resize lock not taken (%lu), going on without it\n", __FUNCTIONW__, wait);
+        }
     }
 
     VIOGPU_DISP_MODE custom = {0};
@@ -328,7 +336,10 @@ void GpuAdapter::SyncResolution(void)
 
     if (hLock)
     {
-        ReleaseMutex(hLock);
+        if (owned)
+        {
+            ReleaseMutex(hLock);
+        }
         CloseHandle(hLock);
     }
 }
