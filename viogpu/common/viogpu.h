@@ -235,6 +235,9 @@ typedef struct virtio_gpu_resource_detach_backing
 #define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE    0x0002
 #define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
 
+// QEMU refuses a guest-memory resource described by more entries than this (virtio_gpu_create_mapping_iov).
+#define VIOGPU_MAX_BLOB_ENTRIES 16384
+
 /* VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: create a blob resource; the mem entries (guest pages) follow the
    command as data, exactly like ATTACH_BACKING. For MEM_GUEST the host wraps those pages with udmabuf and
    exports them as a dmabuf scanout — no per-frame TRANSFER_TO_HOST copy, no host GL upload. */

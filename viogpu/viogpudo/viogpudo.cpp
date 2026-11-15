@@ -4859,17 +4859,42 @@ BOOLEAN VioGpuAdapter::CreateBlobResource(UINT resid, PSCATTER_GATHER_LIST sgl, 
         return FALSE;
     }
     RtlZeroMemory(ents, esize);
+    // The SG list has one element per page. Merge physically contiguous pages into one entry: QEMU refuses a
+    // blob with more than 16384 entries (64 MiB of single pages), which a large mode reaches.
+    UINT count = 0;
     for (UINT i = 0; i < nents; i++)
     {
-        ents[i].addr = sgl->Elements[i].Address.QuadPart;
-        ents[i].length = sgl->Elements[i].Length;
-        ents[i].padding = 0;
+        ULONGLONG addr = sgl->Elements[i].Address.QuadPart;
+        ULONG length = sgl->Elements[i].Length;
+        if (count > 0 && ents[count - 1].addr + ents[count - 1].length == addr &&
+            ents[count - 1].length <= MAXULONG - length)
+        {
+            ents[count - 1].length += length;
+        }
+        else
+        {
+            ents[count].addr = addr;
+            ents[count].length = length;
+            ents[count].padding = 0;
+            count++;
+        }
     }
+    if (count > VIOGPU_MAX_BLOB_ENTRIES)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("<--- %s %u mem entries after merging, over the host's limit of %u\n",
+                  __FUNCTION__,
+                  count,
+                  VIOGPU_MAX_BLOB_ENTRIES));
+        delete[] reinterpret_cast<PBYTE>(ents);
+        return FALSE;
+    }
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: %u pages in %u mem entries\n", __FUNCTION__, nents, count));
     m_CtrlQueue.CreateResourceBlob(resid,
                                    VIRTIO_GPU_BLOB_MEM_GUEST,
                                    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
                                    ents,
-                                   nents,
+                                   count,
                                    size);
     return TRUE;
 }
