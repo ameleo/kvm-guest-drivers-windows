@@ -2613,7 +2613,13 @@ NTSTATUS VioGpuAdapter::SetPowerState(DXGK_DEVICE_INFO *pDeviceInfo,
         case PowerDeviceD2:
         case PowerDeviceD3:
             {
-                DestroyFrameBufferObj(TRUE, FALSE, 0);
+                // Every head, not just the first: VioGpuAdapterClose resets the device, and a secondary left
+                // attached keeps its framebuffer object and size across the reset. On D0 its presents would then
+                // still pass the m_pFrameBuf guard and go to a resource the reset host no longer has.
+                for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+                {
+                    DestroyFrameBufferObj(TRUE, FALSE, scan);
+                }
                 VioGpuAdapterClose();
                 pCurrentMode->Flags.FrameBufferIsActive = FALSE;
                 pCurrentMode->FrameBuffer = NULL;
@@ -4222,7 +4228,12 @@ PAGED_CODE_SEG_END
 
 BOOLEAN VioGpuAdapter::ResetToVgaMode(void)
 {
-    DestroyFrameBufferObj(TRUE, TRUE, 0);
+    // Detach every head before the device is reset, as the D3 path does. bKeepBuffer stays TRUE: this runs on the
+    // bugcheck path, possibly above DISPATCH_LEVEL, where DestroyFrameBufferObj must not take the guarded mutex.
+    for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
+    {
+        DestroyFrameBufferObj(TRUE, TRUE, scan);
+    }
     VioGpuAdapterClose();
     return TRUE;
 }
