@@ -4966,11 +4966,15 @@ void VioGpuAdapter::ConfigChanged(void)
     virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_read), &events_read, sizeof(m_u32NumScanouts));
     if (events_read & VIRTIO_GPU_EVENT_DISPLAY)
     {
-        GetDisplayInfo();
+        // Acknowledge BEFORE reading the heads. The host raises one event per console it reconfigures, so a mono to
+        // dual switch can bring a second event while the first is being read. Clearing after the read wiped that
+        // second event too: the next pass found no event, skipped the read, and the intermediate layout stayed.
+        // Cleared first, a later event sets the bit again and the next pass reads the final layout.
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(m_u32NumScanouts));
-        // GetDisplayInfo() above now drives per-scanout hotplug (connect/disconnect
-        // from pmodes[i].enabled) via UpdateChildStatus — nothing else to do here.
+        // GetDisplayInfo() drives per-scanout hotplug (connect/disconnect from pmodes[i].enabled) via
+        // UpdateChildStatus: nothing else to do here.
+        GetDisplayInfo();
     }
 }
 
