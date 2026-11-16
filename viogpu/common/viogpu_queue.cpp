@@ -116,6 +116,13 @@ BOOLEAN VioGpuQueue::WaitForCompletion(PGPU_WAIT_CTX pCtx, ULONG TimeoutMs)
     return FALSE; // caller must NOT touch pBuf — its release belongs to the completion (or happened above)
 }
 
+void VioGpuQueue::AbortWait(PGPU_WAIT_CTX pCtx)
+{
+    PGPU_VBUFFER pBuf = pCtx->pBuf;
+    delete[] reinterpret_cast<PBYTE>(pCtx);
+    ReleaseBuffer(pBuf);
+}
+
 VioGpuQueue::VioGpuQueue()
 {
     m_pBuf = NULL;
@@ -291,7 +298,11 @@ BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
         ReleaseBuffer(vbuf); // frees resp_buf too (resp_size > MAX_INLINE_RESP_SIZE)
         return FALSE;
     }
-    QueueBuffer(vbuf);
+    if (QueueBuffer(vbuf) != 0)
+    {
+        AbortWait(ctx);
+        return FALSE;
+    }
     if (!WaitForCompletion(ctx, 1000))
     {
         // Survivable: the caller just skips this scanout's info. The buffer is released by the wait machinery.
@@ -334,7 +345,11 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
         ReleaseBuffer(vbuf);
         return FALSE;
     }
-    QueueBuffer(vbuf);
+    if (QueueBuffer(vbuf) != 0)
+    {
+        AbortWait(ctx);
+        return FALSE;
+    }
     if (!WaitForCompletion(ctx, 1000))
     {
         // Survivable: the caller falls back to the boot/default EDID. The buffer is released by the wait machinery.
@@ -460,8 +475,11 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
         }
         else
         {
-            QueueBuffer(vbuf);
-            if (WaitForCompletion(ctx, 100))
+            if (QueueBuffer(vbuf) != 0)
+            {
+                AbortWait(ctx);
+            }
+            else if (WaitForCompletion(ctx, 100))
             {
                 ReleaseBuffer(vbuf);
             }
@@ -518,7 +536,11 @@ BOOLEAN CtrlQueue::QueueAndCheck(PGPU_VBUFFER vbuf, UINT res_id, const char *wha
         ReleaseBuffer(vbuf);
         return FALSE;
     }
-    QueueBuffer(vbuf);
+    if (QueueBuffer(vbuf) != 0)
+    {
+        AbortWait(ctx);
+        return FALSE;
+    }
     if (!WaitForCompletion(ctx, 1000))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("---> %s res %u timed out\n", what, res_id));
@@ -712,7 +734,8 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
     if (buf->size > PAGE_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s size is too big %d\n", __FUNCTION__, buf->size));
-        return 0;
+        ret = (UINT)-1;
+        goto Fail;
     }
 
     if (BuildSGElement(&sg[outcnt + incnt], (PVOID)buf->buf, buf->size))
@@ -736,7 +759,8 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
                 if (sgleft == 0)
                 {
                     DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no more sgelenamt spots left %d\n", __FUNCTION__, outcnt));
-                    return 0;
+                    ret = (UINT)-1;
+                    goto Fail;
                 }
             }
         }
@@ -745,7 +769,8 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
     if (buf->resp_size > PAGE_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s resp_size is too big %d\n", __FUNCTION__, buf->resp_size));
-        return 0;
+        ret = (UINT)-1;
+        goto Fail;
     }
 
     if (buf->resp_size && (sgleft > 0))
@@ -764,8 +789,19 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
     Kick();
     Unlock(SavedIrql);
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, ret));
+    if (ret == 0)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, ret));
+        return 0;
+    }
 
+Fail:
+    // The command never reached the device, so no completion will hand the buffer back.
+    DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s command 0x%x not queued, ret = %d\n", __FUNCTION__, ((PGPU_CTRL_HDR)buf->buf)->type, ret));
+    if (buf->auto_release)
+    {
+        ReleaseBuffer(buf);
+    }
     return ret;
 }
 
@@ -1337,7 +1373,6 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
-    UINT res = 0;
     KIRQL SavedIrql;
 
     VirtIOBufferDescriptor sg[1];
@@ -1357,7 +1392,7 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
     Unlock(SavedIrql);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p outcnt = %d, ret = %d\n", __FUNCTION__, buf, outcnt, ret));
-    return res;
+    return ret;
 }
 
 PGPU_VBUFFER CrsrQueue::DequeueCursor(_Out_ UINT *len)
