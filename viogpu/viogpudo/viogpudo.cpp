@@ -3561,19 +3561,22 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         crsr->pos.y = 0;
         crsr->hot_x = pSetPointerShape->XHot;
         crsr->hot_y = pSetPointerShape->YHot;
-        // This UPDATE_CURSOR attaches the resource and shows the sprite, so any pending hide is over.
-        // Remember the hot spot for the UPDATE_CURSOR that re-attaches the sprite after a later hide.
-        m_CursorHotX = pSetPointerShape->XHot;
-        m_CursorHotY = pSetPointerShape->YHot;
-        m_bCursorHidden[scan] = FALSE;
         ret = m_CursorQueue.QueueCursor(vbuf);
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
         if (ret == 0)
         {
+            // This UPDATE_CURSOR attaches the resource and shows the sprite, so any pending hide is over.
+            // Remember the hot spot for the UPDATE_CURSOR that re-attaches the sprite after a later hide.
+            // Recorded only once the command was queued, so a failure leaves the state matching the device.
+            m_CursorHotX = pSetPointerShape->XHot;
+            m_CursorHotY = pSetPointerShape->YHot;
+            m_bCursorHidden[scan] = FALSE;
             status = STATUS_SUCCESS;
         }
         else
         {
+            // The command never reached the device, so no completion will hand the buffer back.
+            m_CursorQueue.ReleaseBuffer(vbuf);
             VioGpuDbgBreak();
         }
     }
@@ -3654,6 +3657,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
             RtlZeroMemory(crsr, sizeof(*crsr));
             crsr->pos.scanout_id = (ULONG)scan;
+            BOOLEAN reattached = FALSE;
 
             if (!visible)
             {
@@ -3673,7 +3677,7 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
                 crsr->pos.y = pSetPointerPosition->Y;
                 crsr->hot_x = m_CursorHotX;
                 crsr->hot_y = m_CursorHotY;
-                m_bCursorHidden[scan] = FALSE;
+                reattached = TRUE;
             }
             else
             {
@@ -3687,10 +3691,16 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p, ret = %d\n", __FUNCTION__, vbuf, ret));
             if (ret == 0)
             {
+                if (reattached)
+                {
+                    m_bCursorHidden[scan] = FALSE; // only once the re-attaching UPDATE_CURSOR was queued
+                }
                 status = STATUS_SUCCESS;
             }
             else
             {
+                // The command never reached the device, so no completion will hand the buffer back.
+                m_CursorQueue.ReleaseBuffer(vbuf);
                 VioGpuDbgBreak();
             }
         }
