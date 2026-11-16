@@ -365,20 +365,45 @@ bool GpuAdapter::GetPrimarySource(UINT *pSourceId)
 // another resolution event.
 void GpuAdapter::SyncPosition(void)
 {
+    // Only a display Windows has on the desktop, like the size in SetResolution. Windows reports a detached display
+    // at 0, 0, and giving it a position with CDS_UPDATEREGISTRY attaches it: going down to one screen, the left
+    // head came back on the desktop at a stale place, and the saved topology then held the wrong set of displays.
+    if (!m_pDisplayPathInfo || m_Index >= m_PathArrayElements ||
+        !(m_pDisplayPathInfo[m_Index].flags & DISPLAYCONFIG_PATH_ACTIVE))
+    {
+        return;
+    }
+    DISPLAY_DEVICE self = {0};
+    self.cb = sizeof(self);
+    bool attached = false;
+    for (DWORD i = 0; EnumDisplayDevices(NULL, i, &self, 0); i++)
+    {
+        if (m_DeviceName == self.DeviceName)
+        {
+            attached = (self.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            break;
+        }
+        self.cb = sizeof(self);
+    }
+    if (!attached)
+    {
+        return;
+    }
+
     UINT primary = 0;
     if (!GetPrimarySource(&primary) || primary == m_SourceId)
     {
         return; // the primary itself, or a primary on another adapter: nothing to place relative to
     }
-    VIOGPU_DISP_POS self = {0};
+    VIOGPU_DISP_POS mine = {0};
     VIOGPU_DISP_POS origin = {0};
-    if (!GetCustomPosition(m_SourceId, &self) || !GetCustomPosition(primary, &origin))
+    if (!GetCustomPosition(m_SourceId, &mine) || !GetCustomPosition(primary, &origin))
     {
         return;
     }
     VIOGPU_DISP_POS pos;
-    pos.X = (SHORT)(self.X - origin.X);
-    pos.Y = (SHORT)(self.Y - origin.Y);
+    pos.X = (SHORT)(mine.X - origin.X);
+    pos.Y = (SHORT)(mine.Y - origin.Y);
     DEVMODE dm = {0};
     dm.dmSize = sizeof(dm);
     if (!EnumDisplaySettings(m_DeviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm))
