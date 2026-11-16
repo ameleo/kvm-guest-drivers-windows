@@ -3658,14 +3658,30 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     UINT size = pEscape->PrivateDriverDataSize;
-    if (size < sizeof(PVIOGPU_ESCAPE))
+    // Two layouts reach this escape. The multi-head one (ScanId at offset 4, the union after it) is at least
+    // sizeof(VIOGPU_ESCAPE). The single-head one of upstream tools is 8 bytes, with the union at offset 4 and no
+    // ScanId: reading it as the multi-head layout would take the width for a head and touch 2 bytes past the
+    // caller's buffer. It is translated into a local request for head 0, and the answer copied back to its own
+    // offset when done.
+    VIOGPU_ESCAPE singleHeadRequest = {0};
+    PVIOGPU_ESCAPE_SINGLE_HEAD pSingleHead = NULL;
+    if (size < sizeof(VIOGPU_ESCAPE))
     {
-        DbgPrint(TRACE_LEVEL_ERROR,
-                 ("%s buffer too small %d, should be at least %d\n",
-                  __FUNCTION__,
-                  pEscape->PrivateDriverDataSize,
-                  size));
-        return STATUS_INVALID_BUFFER_SIZE;
+        if (size < sizeof(VIOGPU_ESCAPE_SINGLE_HEAD))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s buffer too small %d, should be at least %d\n",
+                      __FUNCTION__,
+                      size,
+                      (UINT)sizeof(VIOGPU_ESCAPE_SINGLE_HEAD)));
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        pSingleHead = (PVIOGPU_ESCAPE_SINGLE_HEAD)pEscape->pPrivateDriverData;
+        singleHeadRequest.Type = pSingleHead->Type;
+        singleHeadRequest.DataLength = pSingleHead->DataLength;
+        singleHeadRequest.ScanId = 0;
+        singleHeadRequest.Id = pSingleHead->Id;
+        pVioGpuEscape = &singleHeadRequest;
     }
 
     switch (pVioGpuEscape->Type)
@@ -3763,6 +3779,10 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
             status = STATUS_INVALID_PARAMETER;
     }
 
+    if (pSingleHead != NULL && NT_SUCCESS(status))
+    {
+        pSingleHead->Id = singleHeadRequest.Id; // the answer (device id or resolution) at the caller's offset
+    }
     return status;
 }
 

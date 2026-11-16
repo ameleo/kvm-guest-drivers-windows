@@ -46,12 +46,25 @@ typedef struct _VIOGPU_ESCAPE
 {
     USHORT Type;
     USHORT DataLength;
-    USHORT ScanId; // target head for GET/SET_CUSTOM_RESOLUTION (VidPnSourceId); 0 for GET_DEVICE_ID
+    // Head for GET/SET_CUSTOM_RESOLUTION (the caller's VidPnSourceId), 0 for GET_DEVICE_ID. The driver tells
+    // the 8-byte single-head layout below (no ScanId, the union at offset 4) apart by its size.
+    USHORT ScanId;
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+
+// The single-head escape, as tools built on the upstream header send it.
+typedef struct _VIOGPU_ESCAPE_SINGLE_HEAD
+{
+    USHORT Type;
+    USHORT DataLength;
+    union {
+        ULONG Id;
+        VIOGPU_DISP_MODE Resolution;
+    } DUMMYUNIONNAME;
+} VIOGPU_ESCAPE_SINGLE_HEAD, *PVIOGPU_ESCAPE_SINGLE_HEAD;
 #pragma pack()
 
 #define BASE_NAMED_OBJECTS    L"\\BaseNamedObjects\\"
