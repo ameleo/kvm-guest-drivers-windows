@@ -17,18 +17,18 @@
 #endif // TRACE_LEVEL_INFORMATION
 
 //
-// Route DbgPrint to COM1 (0x3F8) instead of WPP, in a Release build, without turning on DBG.
+// Debugging aid, off by default: route DbgPrint to COM1 (0x3F8) instead of the kernel debugger.
 //
-// WPP traces are collected by ETW inside the guest. That is unusable the moment the display path is what is
-// being debugged: no screen, no way to start the collector, no trace. The serial writer needs nothing in the
-// guest - run QEMU with `-serial file:viogpu-trace.log` and read it on the host.
+// When the display path is what is being debugged there is no screen to start a trace collector from. The serial
+// writer needs nothing in the guest - run QEMU with `-serial file:viogpu-trace.log` and read it on the host.
+// It reprograms COM1 when the driver loads and writes every FATAL trace there, so it must never be on in a build
+// given to guests that may use COM1 (a serial console, kdcom).
 //
-// Turning DBG on would also have done this, but it arms NT_ASSERT everywhere, which turns a display bug into a
-// bugcheck. This toggle keeps Release semantics and only changes where the text goes.
+// It only takes effect in a DBG build. "Win11 Release|x64" is one (see below); the other configurations use WPP.
 //
-// Set to 0 to go back to WPP.
-//
-#define VIOGPU_SERIAL_TRACE 1
+#ifndef VIOGPU_SERIAL_TRACE
+#define VIOGPU_SERIAL_TRACE 0
+#endif
 
 #if DBG
 //
@@ -60,24 +60,6 @@
 
 #define WPP_INIT_TRACING(driver, regpath)  InitializeDebugPrints(driver, regpath);
 #define WPP_CLEANUP(driver)
-#elif VIOGPU_SERIAL_TRACE
-
-extern int nDebugLevel;
-
-void DebugPrintFuncSerial(const char *format, ...);
-void InitializeSerialDebugPrints(void);
-
-#define DbgExpandArguments(...) __VA_ARGS__
-#define DbgPrint(Level, MSG) \
-    if ((Level) <= nDebugLevel) DebugPrintFuncSerial(DbgExpandArguments MSG);
-
-#define VioGpuDbgBreak() {}
-
-// No session to attach to, so tracing is live from the first line of DriverEntry - which is the point: the
-// interesting failures happen long before anything in the guest could start a collector.
-#define WPP_INIT_TRACING(driver, regpath) InitializeSerialDebugPrints()
-#define WPP_CLEANUP(driver)
-
 #else
 //#define DbgPrint(level, line) {};
 

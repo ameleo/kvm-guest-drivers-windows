@@ -29,7 +29,7 @@
 
 #include "viogpu_queue.h"
 #include "baseobj.h"
-#if !DBG && !VIOGPU_SERIAL_TRACE
+#if !DBG
 #include "viogpu_queue.tmh"
 #endif
 
