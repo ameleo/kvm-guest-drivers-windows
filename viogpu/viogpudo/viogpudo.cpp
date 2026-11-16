@@ -2555,6 +2555,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_bHostVirgl = FALSE;
     RtlZeroMemory(m_BlobResidB, sizeof(m_BlobResidB));
     RtlZeroMemory(m_BlobFlip, sizeof(m_BlobFlip));
+    RtlZeroMemory(m_bBlobScanout, sizeof(m_bBlobScanout));
     for (UINT scan = 0; scan < MAX_SCANOUTS; scan++)
         KeInitializeGuardedMutex(&m_FrameBufLock[scan]);
     m_pCursorBuf = NULL;
@@ -3296,7 +3297,7 @@ NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
     if (updrect.right <= (LONG)m_FrameBufW[scanId] && updrect.bottom <= (LONG)m_FrameBufH[scanId] &&
         updrect.right > updrect.left && updrect.bottom > updrect.top)
     {
-        if (!m_bBlobSupported)
+        if (!m_bBlobScanout[scanId])
         {
             m_CtrlQueue.TransferToHost2D(resid,
                                          offset,
@@ -3368,7 +3369,7 @@ VOID VioGpuAdapter::BlackOutScreen(CURRENT_MODE *pCurrentMod)
         UINT bh = min((UINT)pCurrentMod->DispInfo.Height, (UINT)m_FrameBufH[scanId]);
         if (bw > 0 && bh > 0)
         {
-            if (m_bBlobSupported)
+            if (m_bBlobScanout[scanId])
             {
                 // Blob: no TRANSFER/FLUSH — during a mode change those hit QEMU with mismatched rect/resource and
                 // get rejected (resp=0x1205 INVALID_PARAMETER on cmd 0x104), wedging the control queue ("Failed to
@@ -4429,7 +4430,7 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
         // the CREATE side (no id reused across heads in one commit), this fixes the DESTROY side. Unconditional: the
         // old bReset gate skipped it on the resize path — exactly where the race fired. On resize CreateFrameBufferObj
         // re-points the scanout at the new resource in the same synchronous burst (QEMU coalesces → no visible blank).
-        if (m_bBlobSupported)
+        if (m_bBlobScanout[scanId])
         {
             // Detach a BLOB scanout with SET_SCANOUT_BLOB (resource_id=0) — a plain 2D SET_SCANOUT(0) does NOT
             // release a scanout established via SET_SCANOUT_BLOB, so the UNREF below would destroy a resource QEMU
@@ -4468,6 +4469,7 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer, U
         m_FrameBufH[scanId] = 0;
         m_FrameBufStride[scanId] = 0;
         m_FrameBufFormat[scanId] = 0;
+        m_bBlobScanout[scanId] = FALSE;
         m_Idr.PutId(resid);
     }
     if (useLock)
@@ -4765,22 +4767,22 @@ UINT ColorFormat(UINT format)
 }
 
 PAGED_CODE_SEG_BEGIN
-// Create one guest-RAM blob resource over the first nents pages of a framebuffer SG list. QEMU wraps those guest
-// pages into a linear dmabuf (udmabuf). MEM_GUEST + MAPPABLE|SHAREABLE = a flat, host-mappable, shareable blob.
-// CreateResourceBlob takes ownership of the mem-entry array (freed by the queue completion) — the caller must not.
-BOOLEAN VioGpuAdapter::CreateBlobResource(UINT resid, PSCATTER_GATHER_LIST sgl, UINT nents, ULONGLONG size)
+// Build the memory entries of the first nents pages of an SG list. The SG list has one element per page:
+// physically contiguous pages are merged into one entry, since QEMU refuses more than 16384 entries for a
+// resource (64 MiB of single pages), which a large mode reaches on the 2D path as on the blob path. Returns NULL
+// when the entries cannot be allocated or are still over the limit. Freed by the command that carries them.
+PGPU_MEM_ENTRY VioGpuAdapter::BuildMemEntries(PSCATTER_GATHER_LIST sgl, UINT nents, _Out_ UINT *pCount)
 {
     PAGED_CODE();
+    *pCount = 0;
     UINT esize = sizeof(GPU_MEM_ENTRY) * nents;
     PGPU_MEM_ENTRY ents = reinterpret_cast<PGPU_MEM_ENTRY>(new (NonPagedPoolNx) BYTE[esize]);
     if (!ents)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s cannot allocate %u blob mem entries\n", __FUNCTION__, nents));
-        return FALSE;
+        DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s cannot allocate %u mem entries\n", __FUNCTION__, nents));
+        return NULL;
     }
     RtlZeroMemory(ents, esize);
-    // The SG list has one element per page. Merge physically contiguous pages into one entry: QEMU refuses a
-    // blob with more than 16384 entries (64 MiB of single pages), which a large mode reaches.
     UINT count = 0;
     for (UINT i = 0; i < nents; i++)
     {
@@ -4807,15 +4809,64 @@ BOOLEAN VioGpuAdapter::CreateBlobResource(UINT resid, PSCATTER_GATHER_LIST sgl, 
                   count,
                   VIOGPU_MAX_BLOB_ENTRIES));
         delete[] reinterpret_cast<PBYTE>(ents);
-        return FALSE;
+        return NULL;
     }
     DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: %u pages in %u mem entries\n", __FUNCTION__, nents, count));
-    m_CtrlQueue.CreateResourceBlob(resid,
-                                   VIRTIO_GPU_BLOB_MEM_GUEST,
-                                   VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
-                                   ents,
-                                   count,
-                                   size);
+    *pCount = count;
+    return ents;
+}
+
+// Create one guest-RAM blob resource over the first nents pages of a framebuffer SG list. QEMU wraps those guest
+// pages into a linear dmabuf (udmabuf). MEM_GUEST + MAPPABLE|SHAREABLE = a flat, host-mappable, shareable blob.
+// Returns FALSE when the host refused it.
+BOOLEAN VioGpuAdapter::CreateBlobResource(UINT resid, PSCATTER_GATHER_LIST sgl, UINT nents, ULONGLONG size)
+{
+    PAGED_CODE();
+    UINT count = 0;
+    PGPU_MEM_ENTRY ents = BuildMemEntries(sgl, nents, &count);
+    if (!ents)
+    {
+        return FALSE;
+    }
+    return m_CtrlQueue.CreateResourceBlob(resid,
+                                          VIRTIO_GPU_BLOB_MEM_GUEST,
+                                          VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+                                          ents,
+                                          count,
+                                          size);
+}
+
+// Double-buffered guest-RAM blob scanout: two blob resources over the same framebuffer pages, scanned out with
+// SET_SCANOUT_BLOB. Every step waits for the host's answer. On a refusal (host without udmabuf or memfd, a mode
+// over its size limit), whatever was created is destroyed and FALSE is returned, so the caller can fall back to
+// the 2D path for this mode instead of leaving the head black.
+BOOLEAN VioGpuAdapter::CreateBlobScanout(UINT resid, UINT residB, VioGpuObj *obj, UINT format,
+                                         PVIDEO_MODE_INFORMATION pModeInfo, UINT scanId)
+{
+    PAGED_CODE();
+    ULONG size = pModeInfo->ScreenStride * pModeInfo->VisScreenHeight;
+    PSCATTER_GATHER_LIST sgl = obj->GetSGList();
+    UINT nents = BYTES_TO_PAGES(size);
+    if (nents > sgl->NumberOfElements)
+        nents = sgl->NumberOfElements;
+
+    if (!CreateBlobResource(resid, sgl, nents, (ULONGLONG)size))
+    {
+        return FALSE;
+    }
+    if (!CreateBlobResource(residB, sgl, nents, (ULONGLONG)size))
+    {
+        m_CtrlQueue.DestroyResource(resid);
+        return FALSE;
+    }
+    if (!m_CtrlQueue.SetScanoutBlob(scanId, resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight,
+                                    pModeInfo->ScreenStride, TRUE))
+    {
+        m_CtrlQueue.SetScanoutBlob(scanId, 0, 0, 0, 0, 0);
+        m_CtrlQueue.DestroyResource(residB);
+        m_CtrlQueue.DestroyResource(resid);
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -4847,49 +4898,55 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
         return FALSE;
     }
 
+    BOOLEAN blob = FALSE;
     if (m_bBlobSupported)
     {
-        // Double-buffered guest-RAM blob: TWO blob resources over the SAME flat framebuffer (stride=width*4, no
-        // tile/height padding -- exactly what the Linux driver + udmabuf expect; QEMU wraps the guest pages into a
-        // linear dmabuf). We ping-pong the scanout A<->B on every damaged present so QEMU emits a fresh
-        // SET_SCANOUT_BLOB (ScanoutDMABUF2) per frame -- its efficient host path -- rather than a per-frame
+        // Double-buffered guest-RAM blob: TWO blob resources over the SAME flat framebuffer (QEMU wraps the guest
+        // pages into a linear dmabuf). We ping-pong the scanout A<->B on every damaged present so QEMU emits a
+        // fresh SET_SCANOUT_BLOB (ScanoutDMABUF2) per frame -- its efficient host path -- rather than a per-frame
         // RESOURCE_FLUSH (UpdateDMABUF). No TRANSFER_TO_HOST: the udmabuf IS the guest pages.
-        PSCATTER_GATHER_LIST sgl = obj->GetSGList();
-        UINT nents = BYTES_TO_PAGES(size);
-        if (nents > sgl->NumberOfElements)
-            nents = sgl->NumberOfElements;
         UINT residB = m_Idr.GetId();
-        if (!CreateBlobResource(resid, sgl, nents, (ULONGLONG)size))
+        if (CreateBlobScanout(resid, residB, obj, format, pModeInfo, scanId))
         {
+            obj->SetId(resid);
+            m_BlobResidB[scanId] = residB;
+            m_BlobFlip[scanId] = 0;   // currently scanned out = A (resid)
+            blob = TRUE;
+        }
+        else
+        {
+            // Ids are never reused (viogpu_idr): the 2D resource below takes a fresh one.
+            DbgPrint(TRACE_LEVEL_FATAL,
+                     ("%s scan %u: blob scanout refused for %ux%u, using the 2D path for this mode\n",
+                      __FUNCTION__,
+                      scanId,
+                      pModeInfo->VisScreenWidth,
+                      pModeInfo->VisScreenHeight));
             m_Idr.PutId(residB);
             m_Idr.PutId(resid);
-            delete obj;
-            KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
-            return FALSE;
+            resid = m_Idr.GetId();
         }
-        if (!CreateBlobResource(residB, sgl, nents, (ULONGLONG)size))
+    }
+    if (!blob)
+    {
+        // The 2D resource is as wide as the framebuffer rows (the stride may be padded for the blob path), and
+        // the scanout shows its visible part. TRANSFER_TO_HOST_2D reads the guest backing with the resource's
+        // own pitch, so both must match.
+        UINT resWidth = pModeInfo->ScreenStride / 4;
+        m_CtrlQueue.CreateResource(resid, format, resWidth, pModeInfo->VisScreenHeight);
+        if (!GpuObjectAttach(resid, obj))
         {
             m_CtrlQueue.DestroyResource(resid);
-            m_Idr.PutId(residB);
             m_Idr.PutId(resid);
             delete obj;
             KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
             return FALSE;
         }
-        obj->SetId(resid);
-        m_BlobResidB[scanId] = residB;
-        m_BlobFlip[scanId] = 0;   // currently scanned out = A (resid)
-        m_CtrlQueue.SetScanoutBlob(scanId, resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight,
-                                   pModeInfo->ScreenStride);
-    }
-    else
-    {
-        m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
-        GpuObjectAttach(resid, obj);
         m_CtrlQueue.SetScanout(scanId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
         m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
         m_CtrlQueue.ResFlush(resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     }
+    m_bBlobScanout[scanId] = blob;
     m_pFrameBuf[scanId] = obj;
     m_FrameBufW[scanId] = (USHORT)pModeInfo->VisScreenWidth;    // the host resource size — transfers clamp to this
     m_FrameBufH[scanId] = (USHORT)pModeInfo->VisScreenHeight;
@@ -5114,33 +5171,14 @@ BOOLEAN VioGpuAdapter::GpuObjectAttach(UINT res_id, VioGpuObj *obj)
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-    PGPU_MEM_ENTRY ents = NULL;
-    PSCATTER_GATHER_LIST sgl = NULL;
-    UINT size = 0;
-    sgl = obj->GetSGList();
-    size = sizeof(GPU_MEM_ENTRY) * sgl->NumberOfElements;
-    ents = reinterpret_cast<PGPU_MEM_ENTRY>(new (NonPagedPoolNx) BYTE[size]);
-
+    PSCATTER_GATHER_LIST sgl = obj->GetSGList();
+    UINT count = 0;
+    PGPU_MEM_ENTRY ents = BuildMemEntries(sgl, sgl->NumberOfElements, &count);
     if (!ents)
     {
-        DbgPrint(TRACE_LEVEL_FATAL,
-                 ("<--- %s cannot allocate memory %x bytes numberofentries = %d\n",
-                  __FUNCTION__,
-                  size,
-                  sgl->NumberOfElements));
         return FALSE;
     }
-    // FIXME
-    RtlZeroMemory(ents, size);
-
-    for (UINT i = 0; i < sgl->NumberOfElements; i++)
-    {
-        ents[i].addr = sgl->Elements[i].Address.QuadPart;
-        ents[i].length = sgl->Elements[i].Length;
-        ents[i].padding = 0;
-    }
-
-    m_CtrlQueue.AttachBacking(res_id, ents, sgl->NumberOfElements);
+    m_CtrlQueue.AttachBacking(res_id, ents, count);
     obj->SetId(res_id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;

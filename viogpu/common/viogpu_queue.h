@@ -257,9 +257,12 @@ class CtrlQueue : public VioGpuQueue
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
     void DetachBacking(UINT id);
     // Blob scanout path (VIRTIO_GPU_F_RESOURCE_BLOB). CreateResourceBlob takes ownership of ents (freed by the
-    // queue completion, like AttachBacking) — the caller must NOT free them.
-    void CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size);
-    void SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride);
+    // queue completion, like AttachBacking) — the caller must NOT free them. It waits for the host's answer and
+    // returns FALSE when the host refused the resource. SetScanoutBlob does the same when wait is TRUE, and
+    // returns TRUE without waiting otherwise (the per-present flip).
+    BOOLEAN CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size);
+    BOOLEAN SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride,
+                           BOOLEAN wait = FALSE);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);
     BOOLEAN AskDisplayInfo(PGPU_VBUFFER *buf);
@@ -267,6 +270,8 @@ class CtrlQueue : public VioGpuQueue
     BOOLEAN GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid);
 
   private:
+    BOOLEAN QueueAndCheck(PGPU_VBUFFER vbuf, UINT res_id, const char *what);
+
     volatile LONG m_FenceIdr;
 };
 

@@ -507,15 +507,48 @@ PAGED_CODE_SEG_END
 // NONPAGED like SetScanout/DetachBacking/DestroyResource: both blob functions run in DestroyFrameBufferObj, which
 // the bugcheck flow (ResetToVgaMode) may enter at elevated IRQL — paged code there would double-fault.
 
-// Create a blob resource. The guest pages (ents) ride as command data, like ATTACH_BACKING, and the queue
-// completion frees them (FreeBuf) — the caller must NOT free ents.
-void CtrlQueue::CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size)
+// Queue a command, wait for the host's answer and release the buffer. TRUE only when the host answered
+// OK_NODATA. Used where a refused command must be known before going on: a refused CREATE_BLOB or
+// SET_SCANOUT_BLOB leaves the head black unless the caller falls back to the 2D path.
+BOOLEAN CtrlQueue::QueueAndCheck(PGPU_VBUFFER vbuf, UINT res_id, const char *what)
+{
+    PGPU_WAIT_CTX ctx = PrepareWait(vbuf);
+    if (!ctx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    QueueBuffer(vbuf);
+    if (!WaitForCompletion(ctx, 1000))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> %s res %u timed out\n", what, res_id));
+        return FALSE;
+    }
+
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+    BOOLEAN ok = (resp != NULL && resp->type == VIRTIO_GPU_RESP_OK_NODATA);
+    if (!ok)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> %s res %u refused by the host, resp=0x%X\n", what, res_id, resp ? resp->type : 0));
+    }
+    ReleaseBuffer(vbuf);
+    return ok;
+}
+
+// Create a blob resource. The guest pages (ents) ride as command data, like ATTACH_BACKING, and the buffer
+// release frees them (FreeBuf) — the caller must NOT free ents.
+BOOLEAN CtrlQueue::CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, PGPU_MEM_ENTRY ents, UINT nents, ULONGLONG size)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     PGPU_RES_CREATE_BLOB cmd;
     PGPU_VBUFFER vbuf;
     cmd = (PGPU_RES_CREATE_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(ents);
+        return FALSE;
+    }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
     cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
@@ -529,18 +562,24 @@ void CtrlQueue::CreateResourceBlob(UINT res_id, UINT blob_mem, UINT blob_flags, 
     vbuf->data_buf = ents;
     vbuf->data_size = sizeof(*ents) * nents;
 
-    QueueBuffer(vbuf);
+    BOOLEAN ok = QueueAndCheck(vbuf, res_id, "CREATE_BLOB");
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return ok;
 }
 
-void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride)
+BOOLEAN CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT width, UINT height, UINT stride,
+                                  BOOLEAN wait)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     PGPU_SET_SCANOUT_BLOB cmd;
     PGPU_VBUFFER vbuf;
     cmd = (PGPU_SET_SCANOUT_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
     cmd->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
@@ -556,9 +595,18 @@ void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT format, UINT widt
     cmd->strides[0] = stride;
     cmd->offsets[0] = 0;
 
-    QueueBuffer(vbuf);
+    BOOLEAN ok = TRUE;
+    if (wait)
+    {
+        ok = QueueAndCheck(vbuf, res_id, "SET_SCANOUT_BLOB");
+    }
+    else
+    {
+        QueueBuffer(vbuf);
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return ok;
 }
 
 void CtrlQueue::DestroyResource(UINT res_id)
