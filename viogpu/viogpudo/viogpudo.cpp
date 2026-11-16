@@ -4083,11 +4083,6 @@ void VioGpuAdapter::FixEdid(void)
     pdata->Checksum[0] = -Sum;
 }
 
-// Relax the monitor range-limits descriptor (tag 0xFD): QEMU's generated EDID caps the max dot clock around
-// 250 MHz, and since the driver reports REAL frequencies (VSync control), Windows validates every mode's pixel
-// rate against that cap — 3440x1440@75 (371 MHz) silently vanished from the mode list while 2560x1080@75
-// (207 MHz) survived. A virtual monitor has no analog limits: push vsync/hsync/dot-clock maxima to the field
-// maxima so no mode is pruned. Runs BEFORE NeutralizeEdidPhysicalSize, which recomputes the checksum.
 // Block-0 checksum: its 128 bytes must sum to 0 (mod 256), byte 127 included. Only block 0 is ever modified,
 // so an extension block keeps its own checksum.
 static void FixEdidChecksum(BYTE *edid)
@@ -4100,6 +4095,11 @@ static void FixEdidChecksum(BYTE *edid)
     edid[EDID_V1_BLOCK_SIZE - 1] = (BYTE)(0x100 - sum);
 }
 
+// Relax the monitor range-limits descriptor (tag 0xFD): QEMU's generated EDID caps the max dot clock around
+// 250 MHz, and since the driver reports REAL frequencies (VSync control), Windows validates every mode's pixel
+// rate against that cap — 3440x1440@75 (371 MHz) silently vanished from the mode list while 2560x1080@75
+// (207 MHz) survived. A virtual monitor has no analog limits: push vsync/hsync/dot-clock maxima to the field
+// maxima so no mode is pruned. The caller recomputes the checksum.
 static void RelaxEdidRangeLimits(BYTE *edid)
 {
     if (edid == NULL)
@@ -4118,34 +4118,6 @@ static void RelaxEdidRangeLimits(BYTE *edid)
             return;
         }
     }
-}
-
-// Zero the EDID physical-size fields so Windows has NO basis to recommend a >100% DPI scale. A DaaS desktop is
-// rendered 1:1 to the client; letting Windows scale the guest only wastes resolution and produced a surprise zoom
-// once the primary became an external output (an internal panel had a fixed DPI; an external one derives DPI from
-// the EDID physical size). Windows reads the size from TWO places — block-0 bytes 21/22 (max image size, cm) AND
-// each detailed-timing descriptor's mm image size — so both are cleared, then the block-0 checksum is recomputed.
-static void NeutralizeEdidPhysicalSize(BYTE *edid)
-{
-    if (edid == NULL)
-    {
-        return;
-    }
-    edid[21] = 0;   // max horizontal image size (cm)
-    edid[22] = 0;   // max vertical image size (cm)
-    // Four 18-byte descriptors at 54/72/90/108. A detailed-timing descriptor has a non-zero pixel clock (bytes
-    // 0..1); its image size is byte 12 (h mm low), 13 (v mm low), 14 (high nibbles). Display descriptors (pixel
-    // clock 0 = monitor name / range limits) are left untouched.
-    for (int d = 54; d <= 108; d += 18)
-    {
-        if (edid[d] != 0 || edid[d + 1] != 0)
-        {
-            edid[d + 12] = 0;
-            edid[d + 13] = 0;
-            edid[d + 14] = 0;
-        }
-    }
-    FixEdidChecksum(edid);
 }
 
 BOOLEAN VioGpuAdapter::GetEdids(void)
@@ -4227,8 +4199,7 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
 //   product code and serial nudged, so Windows never conflates twin monitors. QEMU can hand the same identity to
 //   every scanout, and a copy of the primary's EDID always has it. A host that gives distinct identities is kept.
 // - the range-limits descriptor is relaxed, so no mode is pruned against QEMU's conservative analog limits.
-// - the physical size is cleared, so Windows stays at 100% scaling. This recomputes the block-0 checksum, so it
-//   runs last.
+// The physical size is left as the host gives it: the host chooses the DPI Windows scales for.
 void VioGpuAdapter::NormalizeHostEdid(UINT32 scanId)
 {
     PAGED_CODE();
@@ -4238,7 +4209,7 @@ void VioGpuAdapter::NormalizeHostEdid(UINT32 scanId)
         m_EDIDs[scanId][12] = (BYTE)(m_EDIDs[scanId][12] + scanId); // serial byte
     }
     RelaxEdidRangeLimits(m_EDIDs[scanId]);
-    NeutralizeEdidPhysicalSize(m_EDIDs[scanId]);
+    FixEdidChecksum(m_EDIDs[scanId]);
 }
 
 // Without a host EDID for the primary (edid=off, or GET_EDID failed) every head would expose the same built-in
