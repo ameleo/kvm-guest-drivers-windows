@@ -852,9 +852,8 @@ BOOLEAN VioGpuBuf::Init(_In_ UINT cnt)
 
     for (UINT i = 0; i < cnt; ++i)
     {
+        // Not zeroed here: the zeroing came before the NULL check, and AllocBuf clears a buffer each time it is taken.
         PGPU_VBUFFER pvbuf = reinterpret_cast<PGPU_VBUFFER>(new (NonPagedPoolNx) BYTE[VBUFFER_SIZE]);
-        // FIXME
-        RtlZeroMemory(pvbuf, VBUFFER_SIZE);
         if (pvbuf)
         {
             KeAcquireSpinLock(&m_SpinLock, &OldIrql);
@@ -1159,7 +1158,7 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
                 m_pMdl = NULL;
                 return FALSE;
             }
-            RtlZeroMemory(m_pVAddr, size);
+            // No RtlZeroMemory: without MM_DONT_ZERO_ALLOCATION, MmAllocatePagesForMdlEx hands back zeroed pages.
             m_bWCAlloc = TRUE;
             m_bSystemMemory = TRUE;
         }
