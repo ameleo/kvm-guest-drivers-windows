@@ -2659,6 +2659,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_ResolutionEvent = NULL;
     m_ResolutionEventHandle = NULL;
     RtlZeroMemory(m_HeadResolutionEvent, sizeof(m_HeadResolutionEvent));
+    RtlZeroMemory(m_HostPosX, sizeof(m_HostPosX));
+    RtlZeroMemory(m_HostPosY, sizeof(m_HostPosY));
     RtlZeroMemory(m_HeadResolutionEventHandle, sizeof(m_HeadResolutionEventHandle));
     m_u64HostFeatures = 0;
     m_u64GuestFeatures = 0;
@@ -3836,6 +3838,38 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 }
                 break;
             }
+        case VIOGPU_GET_CUSTOM_POSITION:
+            {
+                size = sizeof(VIOGPU_DISP_POS);
+                if (pVioGpuEscape->DataLength < size)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("%s buffer too small %d, should be at least %d\n",
+                              __FUNCTION__,
+                              pVioGpuEscape->DataLength,
+                              size));
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                {
+                    // Same source-to-target mapping as VIOGPU_GET_CUSTOM_RESOLUTION. The place is relative to head
+                    // 0, which Windows keeps at 0, 0 as the primary: the host's layout starts its first monitor
+                    // there, but only the offsets between heads matter to the guest.
+                    UINT posScan = m_pVioGpuDod->TargetOfSource((UINT)pVioGpuEscape->ScanId);
+                    if (posScan >= GetNumScanouts())
+                    {
+                        posScan = 0;
+                    }
+                    LONG x = m_HostPosX[posScan] - m_HostPosX[0];
+                    LONG y = m_HostPosY[posScan] - m_HostPosY[0];
+                    if (x < SHRT_MIN || x > SHRT_MAX || y < SHRT_MIN || y > SHRT_MAX)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    pVioGpuEscape->Position.X = (SHORT)x;
+                    pVioGpuEscape->Position.Y = (SHORT)y;
+                }
+                break;
+            }
         case VIOGPU_SET_CUSTOM_RESOLUTION:
             {
                 size = sizeof(VIOGPU_DISP_MODE);
@@ -3931,8 +3965,15 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
     {
         ULONG xres = 0;
         ULONG yres = 0;
+        LONG xpos = 0;
+        LONG ypos = 0;
         // FALSE here only means this head is disabled: the response itself was checked above.
-        BOOLEAN ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
+        BOOLEAN ok = m_CtrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres, &xpos, &ypos);
+        if (ok && xres && yres)
+        {
+            m_HostPosX[i] = xpos;
+            m_HostPosY[i] = ypos;
+        }
 
 
         if (ok && xres && yres)
