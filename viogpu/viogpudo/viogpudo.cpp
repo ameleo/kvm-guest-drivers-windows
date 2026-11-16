@@ -2882,7 +2882,18 @@ PBYTE VioGpuAdapter::GetEdidData(UINT scanId)
     {
         scanId = 0;
     }
-    return m_bEDID[scanId] ? m_EDIDs[scanId] : (PBYTE)(g_gpu_edid);
+    if (m_bEDID[scanId])
+    {
+        return m_EDIDs[scanId];
+    }
+    // A secondary without a host EDID gets its own copy of the built-in one, with a distinct identity, once
+    // GetEdids has prepared it.
+    static const BYTE edid_magic[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    if (scanId > 0 && RtlCompareMemory(m_EDIDs[scanId], edid_magic, sizeof(edid_magic)) == sizeof(edid_magic))
+    {
+        return m_EDIDs[scanId];
+    }
+    return (PBYTE)(g_gpu_edid);
 }
 
 // Refresh rate derived from the FIRST detailed timing descriptor of the host EDID: the host authors the EDID
@@ -4040,6 +4051,25 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
                 m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
                 m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
                 m_bEDID[i] = TRUE;
+            }
+        }
+    }
+
+    // Without a host EDID for the primary (no edid=on, or GET_EDID failed) every head would expose the same
+    // built-in EDID, and Windows would conflate the monitors. Give each secondary its own copy of it, with a
+    // distinct identity nudged like the copy-of-primary above. m_bEDID stays FALSE, since it means "the host
+    // gave this head an EDID" to the mode and refresh-rate logic. GetEdidData returns these copies.
+    if (!m_bEDID[0])
+    {
+        for (UINT32 i = 1; i < numScanouts; i++)
+        {
+            if (!m_bEDID[i])
+            {
+                RtlZeroMemory(m_EDIDs[i], EDID_RAW_BLOCK_SIZE);
+                RtlCopyMemory(m_EDIDs[i], g_gpu_edid, EDID_V1_BLOCK_SIZE);
+                m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i);       // product code low byte (distinct model)
+                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
+                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
             }
         }
     }
