@@ -32,6 +32,8 @@
 #define VIOGPU_GET_DEVICE_ID         0x00
 #define VIOGPU_GET_CUSTOM_RESOLUTION 0x01
 #define VIOGPU_SET_CUSTOM_RESOLUTION 0x02
+// The place of the caller's head in the host's layout, relative to head 0 (the primary, at 0, 0).
+#define VIOGPU_GET_CUSTOM_POSITION   0x03
 
 #pragma pack(1)
 typedef struct _VIOGPU_DISP_MODE
@@ -39,6 +41,12 @@ typedef struct _VIOGPU_DISP_MODE
     USHORT XResolution;
     USHORT YResolution;
 } VIOGPU_DISP_MODE, *PVIOGPU_DISP_MODE;
+
+typedef struct _VIOGPU_DISP_POS
+{
+    SHORT X;
+    SHORT Y;
+} VIOGPU_DISP_POS, *PVIOGPU_DISP_POS;
 #pragma pack()
 
 #pragma pack(1)
@@ -52,6 +60,7 @@ typedef struct _VIOGPU_ESCAPE
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
+        VIOGPU_DISP_POS Position;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
 
@@ -63,6 +72,7 @@ typedef struct _VIOGPU_ESCAPE_SINGLE_HEAD
     union {
         ULONG Id;
         VIOGPU_DISP_MODE Resolution;
+        VIOGPU_DISP_POS Position;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE_SINGLE_HEAD, *PVIOGPU_ESCAPE_SINGLE_HEAD;
 #pragma pack()

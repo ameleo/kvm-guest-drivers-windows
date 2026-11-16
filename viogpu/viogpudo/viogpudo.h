@@ -283,6 +283,9 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN m_bInitialScanArmed;
     PKEVENT m_ResolutionEvent;
     HANDLE m_ResolutionEventHandle;
+    // Each head's place in the host's layout (GET_DISPLAY_INFO), handed to viogpuap with VIOGPU_GET_CUSTOM_POSITION.
+    LONG m_HostPosX[MAX_SCANOUTS];
+    LONG m_HostPosY[MAX_SCANOUTS];
     PKEVENT m_HeadResolutionEvent[MAX_SCANOUTS];
     HANDLE m_HeadResolutionEventHandle[MAX_SCANOUTS];
 };

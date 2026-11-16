@@ -78,6 +78,9 @@ class GpuAdapter
     DISPLAYCONFIG_MODE_INFO *GetDisplayConfig(UINT index);
     bool GetCustomResolution(PVIOGPU_DISP_MODE mode);
     bool SetResolution(PVIOGPU_DISP_MODE mode);
+    bool GetCustomPosition(UINT sourceId, PVIOGPU_DISP_POS pos);
+    bool GetPrimarySource(UINT *pSourceId);
+    void SyncPosition(void);
     void SyncResolution(void);
     void UpdateDisplayConfig(void);
     void ClearDisplayConfig(void);
@@ -94,6 +97,12 @@ class GpuAdapter
     ULONG m_Index;      // this display's path index (matched by GDI device name) - for path ops
     ULONG m_DeviceId;   // device id (GET_DEVICE_ID) - shared per-device, used for the event name
     UINT m_SourceId;    // this display's VidPnSourceId - identifies the head for escape targeting
+    LUID m_AdapterLuid; // this display's adapter, to tell whether the Windows primary is on it
+    // The last host position this display was moved to. Applied once per position the host sends: when Windows
+    // corrects it (an overlap, a gap), the correction fires another resolution event, and retrying the same
+    // position there would loop.
+    VIOGPU_DISP_POS m_LastPosition;
+    bool m_bLastPositionValid;
     UINT m_PathArrayElements;
     UINT m_ModeInfoArrayElements;
     DISPLAYCONFIG_PATH_INFO *m_pDisplayPathInfo;
