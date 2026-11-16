@@ -185,6 +185,7 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN GetDisplayInfo(void);
     int ProcessEdid(void);
     void FixEdid(void);
+    void MakeBuiltinEdidCopies(void);
     BOOLEAN GetEdids(void);
     BOOLEAN RefreshEdid(UINT32 scanId);   // re-read a head's REAL host EDID at arrival (prefer it over the boot copy)
     void NormalizeHostEdid(UINT32 scanId);

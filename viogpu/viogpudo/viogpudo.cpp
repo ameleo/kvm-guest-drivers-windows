@@ -688,7 +688,16 @@ NTSTATUS VioGpuDod::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_P
         SetPowerState(TargetId, PowerDeviceD0, PowerActionNone);
     }
 
+    // m_CurrentMode is indexed by source: find the one shown on TargetId (they differ after "second screen only").
     UINT scanId = (TargetId < MAX_VIEWS) ? (UINT)TargetId : 0;
+    for (UINT src = 0; src < MAX_VIEWS; src++)
+    {
+        if (m_CurrentMode[src].DispInfo.TargetId == TargetId)
+        {
+            scanId = src;
+            break;
+        }
+    }
     m_pHWDevice->BlackOutScreen(&m_CurrentMode[scanId]);
     DbgPrint(TRACE_LEVEL_FATAL,
              ("StopDeviceAndReleasePostDisplayOwnership Width = %d Height = %d Pitch = %d ColorFormat = %dn",
@@ -3364,7 +3373,7 @@ BOOLEAN FindUpdateRect(_In_ ULONG NumMoves,
     return updated;
 }
 
-UINT ColorFormat(UINT format);   // forward decl (defined below) — used by the blob flip in the present
+UINT ColorFormat(UINT format);
 
 NTSTATUS VioGpuAdapter::ExecutePresentDisplayOnly(_In_ BYTE *DstAddr,
                                                   _In_ UINT DstBitPerPixel,
@@ -4047,7 +4056,9 @@ int VioGpuAdapter::ProcessEdid(void)
     }
     else
     {
+        // edid=off: the built-in EDID, cleaned by FixEdid, then a copy with its own identity for each secondary.
         FixEdid();
+        MakeBuiltinEdidCopies();
     }
 
     return AddEdidModes();
@@ -4197,24 +4208,7 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
         }
     }
 
-    // Without a host EDID for the primary (no edid=on, or GET_EDID failed) every head would expose the same
-    // built-in EDID, and Windows would conflate the monitors. Give each secondary its own copy of it, with a
-    // distinct identity nudged like the copy-of-primary above. m_bEDID stays FALSE, since it means "the host
-    // gave this head an EDID" to the mode and refresh-rate logic. GetEdidData returns these copies.
-    if (!m_bEDID[0])
-    {
-        for (UINT32 i = 1; i < numScanouts; i++)
-        {
-            if (!m_bEDID[i])
-            {
-                RtlZeroMemory(m_EDIDs[i], EDID_RAW_BLOCK_SIZE);
-                RtlCopyMemory(m_EDIDs[i], g_gpu_edid, EDID_V1_BLOCK_SIZE);
-                m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i);       // product code low byte (distinct model)
-                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
-                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
-            }
-        }
-    }
+    MakeBuiltinEdidCopies();
 
     for (UINT32 i = 0; i < numScanouts; i++)
     {
@@ -4245,6 +4239,30 @@ void VioGpuAdapter::NormalizeHostEdid(UINT32 scanId)
     }
     RelaxEdidRangeLimits(m_EDIDs[scanId]);
     NeutralizeEdidPhysicalSize(m_EDIDs[scanId]);
+}
+
+// Without a host EDID for the primary (edid=off, or GET_EDID failed) every head would expose the same built-in
+// EDID, and Windows would conflate the monitors. Give each secondary its own copy of it, with a distinct identity
+// nudged like the copy of the primary's host EDID. m_bEDID stays FALSE, since it means "the host gave this head an
+// EDID" to the mode and refresh-rate logic. GetEdidData returns these copies.
+void VioGpuAdapter::MakeBuiltinEdidCopies(void)
+{
+    PAGED_CODE();
+    if (m_bEDID[0])
+    {
+        return;
+    }
+    for (UINT32 i = 1; i < GetNumScanouts(); i++)
+    {
+        if (!m_bEDID[i])
+        {
+            RtlZeroMemory(m_EDIDs[i], EDID_RAW_BLOCK_SIZE);
+            RtlCopyMemory(m_EDIDs[i], g_gpu_edid, EDID_V1_BLOCK_SIZE);
+            m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i); // product code low byte (distinct model)
+            m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i); // serial byte
+            FixEdidChecksum(m_EDIDs[i]);
+        }
+    }
 }
 
 BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
