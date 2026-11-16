@@ -59,6 +59,7 @@ VioGpuDod::VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     m_PersistentDispMode0Height = 0;
     KeInitializeDpc(&m_VsyncTimerDpc, VsyncTimerProcGate, this);
     KeInitializeTimer(&m_VsyncTimer);
+    m_pVsyncHrTimer = NULL;
     m_bVsyncEnabled = FALSE;
     m_bVsyncPowered = TRUE;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -68,6 +69,7 @@ VioGpuDod::~VioGpuDod(void)
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s 0x%p\n", __FUNCTION__, m_pHWDevice));
+    DeleteVsyncTimer();
     delete m_pHWDevice;
     m_pHWDevice = NULL;
 }
@@ -260,8 +262,10 @@ NTSTATUS VioGpuDod::StopDevice(VOID)
     PAGED_CODE();
 
     EnableVsync(FALSE);   // stop the simulated-vblank timer before the device goes away
-    // KeCancelTimer does not wait for a timer DPC that is already queued or running, and the device object may be
-    // freed right after this returns: let that DPC finish first.
+    // Cancelling does not wait for a timer callback that is already queued or running, and the device object may
+    // be freed right after this returns: deleting the high-resolution timer waits for its callback, and the queued
+    // DPCs are flushed for the fallback KTIMER.
+    DeleteVsyncTimer();
     KeFlushQueuedDpcs();
     m_Flags.DriverStarted = FALSE;
     return STATUS_SUCCESS;
@@ -957,16 +961,44 @@ VOID VioGpuDod::EnableVsync(BOOLEAN bEnable)
     m_bVsyncEnabled = bEnable;
     if (!bEnable)
     {
+        if (m_pVsyncHrTimer != NULL)
+        {
+            ExCancelTimer(m_pVsyncHrTimer, NULL);
+        }
         KeCancelTimer(&m_VsyncTimer);
         DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: vsync timer stopped\n", __FUNCTION__));
     }
     else
     {
         const UINT rate = m_pHWDevice ? m_pHWDevice->GetEdidRefreshHz() : VIOGPU_VSYNC_RATE;
-        LARGE_INTEGER due;
-        due.QuadPart = -10000000LL / rate;
-        KeSetTimerEx(&m_VsyncTimer, due, 1000 / rate, &m_VsyncTimerDpc);
-        DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: vsync timer started (%u Hz)\n", __FUNCTION__, rate));
+        const LONGLONG period = 10000000LL / rate; // 100 ns units
+        if (m_pVsyncHrTimer == NULL)
+        {
+            m_pVsyncHrTimer = ExAllocateTimer(VsyncHrTimerCallback, this, EX_TIMER_HIGH_RESOLUTION);
+        }
+        if (m_pVsyncHrTimer != NULL)
+        {
+            ExSetTimer(m_pVsyncHrTimer, -period, period, NULL);
+            DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: vsync timer started (%u Hz)\n", __FUNCTION__, rate));
+        }
+        else
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -period;
+            KeSetTimerEx(&m_VsyncTimer, due, 1000 / rate, &m_VsyncTimerDpc);
+            DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: vsync timer started (%u Hz, millisecond timer)\n", __FUNCTION__, rate));
+        }
+    }
+}
+
+// Delete the high-resolution vsync timer and wait for a callback still running. PASSIVE_LEVEL only.
+VOID VioGpuDod::DeleteVsyncTimer(void)
+{
+    PAGED_CODE();
+    if (m_pVsyncHrTimer != NULL)
+    {
+        ExDeleteTimer(m_pVsyncHrTimer, TRUE, TRUE, NULL);
+        m_pVsyncHrTimer = NULL;
     }
 }
 
@@ -2281,6 +2313,13 @@ VOID VioGpuDod::VsyncTimerProc(void)
                                                    0,
                                                    &bDummy);
     }
+}
+
+VOID VioGpuDod::VsyncHrTimerCallback(_In_ PEX_TIMER Timer, _In_opt_ PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Timer);
+    VioGpuDod *pDod = reinterpret_cast<VioGpuDod *>(Context);
+    pDod->VsyncTimerProc();
 }
 
 VOID VioGpuDod::VsyncTimerProcGate(_In_ _KDPC *dpc, _In_ PVOID context, _In_ PVOID arg1, _In_ PVOID arg2)

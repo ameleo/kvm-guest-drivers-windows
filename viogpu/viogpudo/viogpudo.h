@@ -308,6 +308,10 @@ class VioGpuDod
     // VSync control (the documented KMDOD contract): once the signal info reports a REAL refresh rate, dxgkrnl
     // requires the vsync-interrupt machinery. A virtio-gpu has no scanout vblank, so a 60 Hz KTIMER simulates it:
     // DPC -> DxgkCbSynchronizeExecution -> DxgkCbNotifyInterrupt(DISPLAYONLY_VSYNC) + DxgkCbQueueDpc (QXL's model).
+    // The vblank period is set in 100 ns units on a high-resolution timer (allocated on the first enable, deleted
+    // in StopDevice). The KTIMER only counts whole milliseconds on the system clock tick (15.6 ms by default), so
+    // 60 Hz ran at about 64 Hz and 144 Hz was out of reach: it stays as the fallback if the allocation fails.
+    PEX_TIMER m_pVsyncHrTimer;
     KTIMER m_VsyncTimer;
     KDPC m_VsyncTimerDpc;
     BOOLEAN m_bVsyncEnabled;
@@ -462,6 +466,8 @@ class VioGpuDod
     VOID VsyncTimerProc(void);
     static BOOLEAN VsyncTimerSynchRoutine(PVOID context);
     static VOID VsyncTimerProcGate(_In_ _KDPC *dpc, _In_ PVOID context, _In_ PVOID arg1, _In_ PVOID arg2);
+    static VOID VsyncHrTimerCallback(_In_ PEX_TIMER Timer, _In_opt_ PVOID Context);
+    VOID DeleteVsyncTimer(void);
 
     PDXGKRNL_INTERFACE GetDxgkInterface(void)
     {
