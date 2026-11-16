@@ -70,3 +70,7 @@ typedef struct _VIOGPU_ESCAPE_SINGLE_HEAD
 #define BASE_NAMED_OBJECTS    L"\\BaseNamedObjects\\"
 #define GLOBAL_OBJECTS        L"Global\\"
 #define RESOLUTION_EVENT_NAME L"VioGpuResolutionEvent"
+// One auto-reset event per source, named RESOLUTION_HEAD_EVENT_NAME<device id>_<VidPnSourceId>. It stays signaled
+// until that source's agent thread waits on it, so a change that comes while the thread is busy is not lost, unlike
+// the RESOLUTION_EVENT_NAME pulse that older agents use.
+#define RESOLUTION_HEAD_EVENT_NAME L"VioGpuResolutionHeadEvent"

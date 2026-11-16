@@ -2658,6 +2658,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_pWorkThread = NULL;
     m_ResolutionEvent = NULL;
     m_ResolutionEventHandle = NULL;
+    RtlZeroMemory(m_HeadResolutionEvent, sizeof(m_HeadResolutionEvent));
+    RtlZeroMemory(m_HeadResolutionEventHandle, sizeof(m_HeadResolutionEventHandle));
     m_u64HostFeatures = 0;
     m_u64GuestFeatures = 0;
     m_u32NumCapsets = 0;
@@ -3015,6 +3017,31 @@ VOID VioGpuAdapter::CreateResolutionEvent(VOID)
     }
     KeClearEvent(m_ResolutionEvent);
     ObReferenceObject(m_ResolutionEvent);
+
+    // The per-source auto-reset events of current agents (see RESOLUTION_HEAD_EVENT_NAME). A failure here only
+    // leaves those agents on the pulse.
+    for (UINT src = 0; src < MAX_SCANOUTS; src++)
+    {
+        DECLARE_UNICODE_STRING_SIZE(HeadEventName, 256);
+        status = RtlUnicodeStringPrintf(&HeadEventName,
+                                        L"%ws%ws%ws_%u",
+                                        BASE_NAMED_OBJECTS,
+                                        RESOLUTION_HEAD_EVENT_NAME,
+                                        DeviceNumber.Buffer,
+                                        src);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+        m_HeadResolutionEvent[src] = IoCreateSynchronizationEvent(&HeadEventName, &m_HeadResolutionEventHandle[src]);
+        if (m_HeadResolutionEvent[src] == NULL)
+        {
+            m_HeadResolutionEventHandle[src] = NULL;
+            break;
+        }
+        KeClearEvent(m_HeadResolutionEvent[src]);
+        ObReferenceObject(m_HeadResolutionEvent[src]);
+    }
 }
 
 VOID VioGpuAdapter::NotifyResolutionEvent(VOID)
@@ -3026,6 +3053,14 @@ VOID VioGpuAdapter::NotifyResolutionEvent(VOID)
         DbgPrint(TRACE_LEVEL_ERROR, ("NotifyResolutionEvent\n"));
         KeSetEvent(m_ResolutionEvent, IO_NO_INCREMENT, FALSE);
         KeClearEvent(m_ResolutionEvent);
+    }
+    // Left signaled: each source's agent thread consumes its own event when it next waits.
+    for (UINT src = 0; src < MAX_SCANOUTS; src++)
+    {
+        if (m_HeadResolutionEvent[src] != NULL)
+        {
+            KeSetEvent(m_HeadResolutionEvent[src], IO_NO_INCREMENT, FALSE);
+        }
     }
 }
 
@@ -3043,6 +3078,20 @@ VOID VioGpuAdapter::CloseResolutionEvent(VOID)
     {
         ObDereferenceObject(m_ResolutionEvent);
         m_ResolutionEvent = NULL;
+    }
+
+    for (UINT src = 0; src < MAX_SCANOUTS; src++)
+    {
+        if (m_HeadResolutionEventHandle[src] != NULL)
+        {
+            ZwClose(m_HeadResolutionEventHandle[src]);
+            m_HeadResolutionEventHandle[src] = NULL;
+        }
+        if (m_HeadResolutionEvent[src] != NULL)
+        {
+            ObDereferenceObject(m_HeadResolutionEvent[src]);
+            m_HeadResolutionEvent[src] = NULL;
+        }
     }
 }
 

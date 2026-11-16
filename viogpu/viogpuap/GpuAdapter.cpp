@@ -144,10 +144,23 @@ void GpuAdapter::Init()
         m_SourceId = openAdapter.VidPnSourceId;
         if (QueryAdapterId())
         {
+            // This source's own auto-reset event: it stays signaled until this thread waits, so a change that
+            // comes while SyncResolution runs is not lost. A driver older than this agent has none: fall back to
+            // the adapter-wide pulse.
             std::wstring EventName = GLOBAL_OBJECTS;
-            EventName += RESOLUTION_EVENT_NAME;
+            EventName += RESOLUTION_HEAD_EVENT_NAME;
             EventName += std::to_wstring(m_DeviceId);
-            m_hResolutionEvent = ::OpenEvent(EVENT_ALL_ACCESS | EVENT_MODIFY_STATE, FALSE, EventName.c_str());
+            EventName += L"_";
+            EventName += std::to_wstring(m_SourceId);
+            m_hResolutionEvent = ::OpenEvent(SYNCHRONIZE, FALSE, EventName.c_str());
+            if (m_hResolutionEvent == NULL)
+            {
+                PrintMessage(L"No per-source event %ws (%d), using the adapter event.\n", EventName.c_str(), GetLastError());
+                EventName = GLOBAL_OBJECTS;
+                EventName += RESOLUTION_EVENT_NAME;
+                EventName += std::to_wstring(m_DeviceId);
+                m_hResolutionEvent = ::OpenEvent(EVENT_ALL_ACCESS | EVENT_MODIFY_STATE, FALSE, EventName.c_str());
+            }
             if (m_hResolutionEvent == NULL)
             {
                 PrintMessage(L"Cannot open event %ws Error = %d.\n", EventName.c_str(), GetLastError());

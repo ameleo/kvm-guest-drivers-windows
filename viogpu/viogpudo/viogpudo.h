@@ -283,6 +283,8 @@ class VioGpuAdapter : IVioGpuPCI
     BOOLEAN m_bInitialScanArmed;
     PKEVENT m_ResolutionEvent;
     HANDLE m_ResolutionEventHandle;
+    PKEVENT m_HeadResolutionEvent[MAX_SCANOUTS];
+    HANDLE m_HeadResolutionEventHandle[MAX_SCANOUTS];
 };
 
 class VioGpuDod
