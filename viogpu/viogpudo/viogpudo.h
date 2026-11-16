@@ -220,7 +220,7 @@ class VioGpuAdapter : IVioGpuPCI
     UINT64 m_u64HostFeatures;
     UINT64 m_u64GuestFeatures;
     BOOLEAN m_bBlobSupported;   // VIRTIO_GPU_F_RESOURCE_BLOB negotiated -> blob scanout path (else classic 2D)
-    BOOLEAN m_bHostVirgl;       // host offers VIRGL (`-gl` device): no MEM_GUEST blob scanout, CREATE_3D for orientation
+    BOOLEAN m_bHostVirgl;       // host offers VIRGL (`-gl` device): no MEM_GUEST blob scanout
     UINT32 m_u32NumCapsets;
     UINT32 m_u32NumScanouts;
     CtrlQueue m_CtrlQueue;

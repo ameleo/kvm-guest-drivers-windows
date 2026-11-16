@@ -4950,28 +4950,7 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     }
     else
     {
-        if (m_bHostVirgl)
-        {
-            // CREATE_2D on a virgl host scans the image out upside down (see CreateResource3D), and a scanout
-            // pointed at a resource the host refused aborts QEMU: a head that stays dark is recoverable, a dead
-            // hypervisor is not.
-            if (!m_CtrlQueue.CreateResource3D(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0))
-            {
-                DbgPrint(TRACE_LEVEL_FATAL,
-                         ("%s scan %u: resource %u was not created, refusing to scan it out\n",
-                          __FUNCTION__,
-                          scanId,
-                          resid));
-                m_Idr.PutId(resid);
-                delete obj;
-                KeReleaseGuardedMutex(&m_FrameBufLock[scanId]);
-                return FALSE;
-            }
-        }
-        else
-        {
-            m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
-        }
+        m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
         GpuObjectAttach(resid, obj);
         m_CtrlQueue.SetScanout(scanId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
         m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
