@@ -219,6 +219,8 @@ class VioGpuQueue
     // on timeout, in which case the buffer belongs to the machinery (the caller must NOT touch or release it).
     PGPU_WAIT_CTX PrepareWait(PGPU_VBUFFER pBuf);
     BOOLEAN WaitForCompletion(PGPU_WAIT_CTX pCtx, ULONG TimeoutMs);
+    // The command of a prepared wait was not queued: no completion will come. Frees the context and the buffer.
+    void AbortWait(PGPU_WAIT_CTX pCtx);
 
   protected:
     _IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql,
@@ -246,6 +248,8 @@ class CtrlQueue : public VioGpuQueue
     PVOID AllocCmd(PGPU_VBUFFER *buf, int sz);
     PVOID AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz);
 
+    // 0 when the command reached the virtqueue. On failure the command is dropped: an auto-release buffer is
+    // released here, a buffer with a prepared wait is left to the caller (AbortWait).
     UINT QueueBuffer(PGPU_VBUFFER buf);
     PGPU_VBUFFER DequeueBuffer(_Out_ UINT *len);
 
