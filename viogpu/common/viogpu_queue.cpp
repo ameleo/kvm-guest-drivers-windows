@@ -227,7 +227,7 @@ PAGED_CODE_SEG_END
 
 PAGED_CODE_SEG_BEGIN
 
-BOOLEAN CtrlQueue::GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres)
+BOOLEAN CtrlQueue::GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres, PLONG xpos, PLONG ypos)
 {
     PAGED_CODE();
 
@@ -250,6 +250,16 @@ BOOLEAN CtrlQueue::GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG
                   resp->pmodes[id].r.y));
         *xres = resp->pmodes[id].r.width;
         *yres = resp->pmodes[id].r.height;
+        // The place of this scanout in the host's layout. The fields are unsigned in the protocol, but QEMU stores
+        // the signed offsets its display backend gave (a monitor left of or above the first one is negative).
+        if (xpos != NULL)
+        {
+            *xpos = (LONG)resp->pmodes[id].r.x;
+        }
+        if (ypos != NULL)
+        {
+            *ypos = (LONG)resp->pmodes[id].r.y;
+        }
     }
     else
     {

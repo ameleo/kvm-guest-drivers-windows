@@ -31,7 +31,7 @@
 
 GpuAdapter::GpuAdapter(const std::wstring LinkName)
     : m_hThread(NULL), m_hStopEvent(NULL), m_hResolutionEvent(NULL), m_hDC(NULL), m_hAdapter(NULL), m_Index(-1),
-      m_DeviceId(0), m_SourceId(0), m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL),
+      m_DeviceId(0), m_SourceId(0), m_AdapterLuid{0, 0}, m_LastPosition{0, 0}, m_bLastPositionValid(false), m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL),
       m_pDisplayModeInfo(NULL), m_Flag(None)
 {
     m_DeviceName = LinkName;
@@ -142,6 +142,7 @@ void GpuAdapter::Init()
         // This is the head (VidPnSourceId) this \\.\DISPLAYn maps to. Used to
         // target the right head for the custom resolution and the display path.
         m_SourceId = openAdapter.VidPnSourceId;
+        m_AdapterLuid = openAdapter.AdapterLuid;
         if (QueryAdapterId())
         {
             // This source's own auto-reset event: it stays signaled until this thread waits, so a change that
@@ -302,6 +303,137 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
     return (r == DISP_CHANGE_SUCCESSFUL);
 }
 
+// The place of a source's head in the host's layout, relative to head 0. False with a driver that does not report
+// it.
+bool GpuAdapter::GetCustomPosition(UINT sourceId, PVIOGPU_DISP_POS pos)
+{
+    if (m_hAdapter && pos)
+    {
+        VIOGPU_ESCAPE data{0};
+        data.DataLength = sizeof(VIOGPU_DISP_POS);
+        data.Type = VIOGPU_GET_CUSTOM_POSITION;
+        data.ScanId = (USHORT)sourceId;
+
+        D3DKMT_ESCAPE escape = {0};
+        escape.hAdapter = m_hAdapter;
+        escape.pPrivateDriverData = &data;
+        escape.PrivateDriverDataSize = sizeof(data);
+
+        if (NT_SUCCESS(D3DKMTEscape(&escape)))
+        {
+            *pos = data.Position;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The VidPnSourceId of the Windows primary display, when it is on this display's adapter.
+bool GpuAdapter::GetPrimarySource(UINT *pSourceId)
+{
+    DISPLAY_DEVICE dd = {0};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevices(NULL, i, &dd, 0); i++)
+    {
+        if (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)
+        {
+            D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open = {0};
+            wcsncpy_s(open.DeviceName, dd.DeviceName, _TRUNCATE);
+            if (!NT_SUCCESS(D3DKMTOpenAdapterFromGdiDisplayName(&open)))
+            {
+                return false;
+            }
+            D3DKMT_CLOSEADAPTER close = {0};
+            close.hAdapter = open.hAdapter;
+            D3DKMTCloseAdapter(&close);
+            if (open.AdapterLuid.LowPart != m_AdapterLuid.LowPart || open.AdapterLuid.HighPart != m_AdapterLuid.HighPart)
+            {
+                return false;
+            }
+            *pSourceId = open.VidPnSourceId;
+            return true;
+        }
+        dd.cb = sizeof(dd);
+    }
+    return false;
+}
+
+// Place this display where the client's monitor is among the others, as an RDP session does, instead of the
+// default left-to-right row Windows picks for a monitor it does not know. Windows keeps its primary at 0, 0, which
+// need not be head 0 (the user may have made another display the main one): the place is taken relative to the
+// primary's place in the host's layout. Only applied when it differs, like the size: a position change fires
+// another resolution event.
+void GpuAdapter::SyncPosition(void)
+{
+    // Only a display Windows has on the desktop, like the size in SetResolution. Windows reports a detached display
+    // at 0, 0, and giving it a position with CDS_UPDATEREGISTRY attaches it: going down to one screen, the left
+    // head came back on the desktop at a stale place, and the saved topology then held the wrong set of displays.
+    if (!m_pDisplayPathInfo || m_Index >= m_PathArrayElements ||
+        !(m_pDisplayPathInfo[m_Index].flags & DISPLAYCONFIG_PATH_ACTIVE))
+    {
+        return;
+    }
+    DISPLAY_DEVICE self = {0};
+    self.cb = sizeof(self);
+    bool attached = false;
+    for (DWORD i = 0; EnumDisplayDevices(NULL, i, &self, 0); i++)
+    {
+        if (m_DeviceName == self.DeviceName)
+        {
+            attached = (self.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            break;
+        }
+        self.cb = sizeof(self);
+    }
+    if (!attached)
+    {
+        return;
+    }
+
+    UINT primary = 0;
+    if (!GetPrimarySource(&primary) || primary == m_SourceId)
+    {
+        return; // the primary itself, or a primary on another adapter: nothing to place relative to
+    }
+    VIOGPU_DISP_POS mine = {0};
+    VIOGPU_DISP_POS origin = {0};
+    if (!GetCustomPosition(m_SourceId, &mine) || !GetCustomPosition(primary, &origin))
+    {
+        return;
+    }
+    VIOGPU_DISP_POS pos;
+    pos.X = (SHORT)(mine.X - origin.X);
+    pos.Y = (SHORT)(mine.Y - origin.Y);
+    DEVMODE dm = {0};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettings(m_DeviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm))
+    {
+        return;
+    }
+    if (dm.dmPosition.x == pos.X && dm.dmPosition.y == pos.Y)
+    {
+        return;
+    }
+    if (m_bLastPositionValid && m_LastPosition.X == pos.X && m_LastPosition.Y == pos.Y)
+    {
+        return; // already asked for this one and Windows placed the display elsewhere: do not fight it
+    }
+    m_LastPosition = pos;
+    m_bLastPositionValid = true;
+    PrintMessage(L"%ws: %ws from %d,%d to %d,%d\n",
+                 __FUNCTIONW__,
+                 m_DeviceName.c_str(),
+                 dm.dmPosition.x,
+                 dm.dmPosition.y,
+                 pos.X,
+                 pos.Y);
+    dm.dmPosition.x = pos.X;
+    dm.dmPosition.y = pos.Y;
+    dm.dmFields = DM_POSITION;
+    // Only this display moves, like the size change: the topology (which displays are active) is left alone.
+    ChangeDisplaySettingsEx(m_DeviceName.c_str(), &dm, NULL, CDS_UPDATEREGISTRY, NULL);
+}
+
 void GpuAdapter::SyncResolution(void)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
@@ -336,12 +468,17 @@ void GpuAdapter::SyncResolution(void)
             SetResolution(&custom);
         }
     }
+    SyncPosition();
 
     // Wake a STATIC head after a no-op sync: when a client (re)connects asking for the size a head already has,
     // nothing above changes anything, so nothing wakes DWM — a never-painted head stays black until the first
     // user-generated damage (a click). Invalidating every window forces a full repaint -> DWM presents -> the
-    // driver flips -> the host stream gets a real frame. Cheap, and a genuine resize repaints anyway.
-    InvalidateRect(NULL, NULL, TRUE);
+    // driver flips -> the host stream gets a real frame. One repaint covers every head, and every source's thread
+    // wakes on each event: only source 0's thread does it.
+    if (m_SourceId == 0)
+    {
+        InvalidateRect(NULL, NULL, TRUE);
+    }
 
     if (hLock)
     {
@@ -364,9 +501,9 @@ void GpuAdapter::Run()
         const HANDLE handles[] = {m_hStopEvent, m_hResolutionEvent};
         while (1)
         {
-            // The resolution event is a driver-side NOTIFICATION event (IoCreateNotificationEvent), signalled
-            // via KeSetEvent, which releases ALL waiters at once, so both heads' threads wake on every signal
-            // with no miss. Wait INFINITE, no polling needed.
+            // This source's own auto-reset event (see RESOLUTION_HEAD_EVENT_NAME): it stays signaled until this
+            // wait, so a change that came during SyncResolution runs it again. With an older driver it is the
+            // adapter-wide pulse, which only wakes the threads already waiting. Wait INFINITE, no polling needed.
             if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0)
             {
                 break;   // stop event
