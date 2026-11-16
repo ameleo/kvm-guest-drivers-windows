@@ -3977,6 +3977,18 @@ void VioGpuAdapter::FixEdid(void)
 // rate against that cap — 3440x1440@75 (371 MHz) silently vanished from the mode list while 2560x1080@75
 // (207 MHz) survived. A virtual monitor has no analog limits: push vsync/hsync/dot-clock maxima to the field
 // maxima so no mode is pruned. Runs BEFORE NeutralizeEdidPhysicalSize, which recomputes the checksum.
+// Block-0 checksum: its 128 bytes must sum to 0 (mod 256), byte 127 included. Only block 0 is ever modified,
+// so an extension block keeps its own checksum.
+static void FixEdidChecksum(BYTE *edid)
+{
+    BYTE sum = 0;
+    for (int i = 0; i < EDID_V1_BLOCK_SIZE - 1; ++i)
+    {
+        sum = (BYTE)(sum + edid[i]);
+    }
+    edid[EDID_V1_BLOCK_SIZE - 1] = (BYTE)(0x100 - sum);
+}
+
 static void RelaxEdidRangeLimits(BYTE *edid)
 {
     if (edid == NULL)
@@ -4022,13 +4034,7 @@ static void NeutralizeEdidPhysicalSize(BYTE *edid)
             edid[d + 14] = 0;
         }
     }
-    // Block-0 checksum: the 128 bytes must sum to 0 (mod 256).
-    BYTE sum = 0;
-    for (int i = 0; i < EDID_RAW_BLOCK_SIZE - 1; ++i)
-    {
-        sum = (BYTE)(sum + edid[i]);
-    }
-    edid[EDID_RAW_BLOCK_SIZE - 1] = (BYTE)(0x100 - sum);
+    FixEdidChecksum(edid);
 }
 
 BOOLEAN VioGpuAdapter::GetEdids(void)
@@ -4086,10 +4092,7 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
             if (!m_bEDID[i])
             {
                 RtlCopyMemory(m_EDIDs[i], m_EDIDs[0], EDID_RAW_BLOCK_SIZE);
-                m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i);       // product code low byte (distinct model)
-                m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i);       // serial byte
-                m_EDIDs[i][127] = (BYTE)(m_EDIDs[i][127] - 2 * i); // keep block-0 checksum == 0 (two bytes +i)
-                m_bEDID[i] = TRUE;
+                m_bEDID[i] = TRUE; // its identity is nudged by NormalizeHostEdid below
             }
         }
     }
@@ -4113,33 +4116,35 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
         }
     }
 
-    // Distinctness for REAL per-head EDIDs too: QEMU can hand the SAME identity block (manufacturer + product +
-    // serial, bytes 8..15) to every scanout it enables at boot. The copy-of-primary fallback above and
-    // RefreshEdid (hotplug arrival) already nudge colliding identities, but a real EDID received at BOOT skipped
-    // it -> Windows CONFLATES the twin monitors (non-deterministic extend, mixed-up heads). Nudge any
-    // non-primary head whose identity matches head 0. (Checksum is recomputed below.)
-    for (UINT32 i = 1; i < numScanouts; i++)
-    {
-        if (m_bEDID[i] && m_bEDID[0] && RtlCompareMemory(&m_EDIDs[i][8], &m_EDIDs[0][8], 8) == 8)
-        {
-            m_EDIDs[i][10] = (BYTE)(m_EDIDs[i][10] + i); // product code low byte (distinct model)
-            m_EDIDs[i][12] = (BYTE)(m_EDIDs[i][12] + i); // serial byte
-        }
-    }
-
-    // Force 100% scaling: strip the physical size from every head's EDID (recomputes the checksum, so it runs
-    // AFTER the distinct-identity nudge above). Windows then has no basis for a >96 DPI recommendation.
     for (UINT32 i = 0; i < numScanouts; i++)
     {
         if (m_bEDID[i])
         {
-            RelaxEdidRangeLimits(m_EDIDs[i]);      // no mode pruning against QEMU's conservative analog limits
-            NeutralizeEdidPhysicalSize(m_EDIDs[i]);
+            NormalizeHostEdid(i);
         }
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
+}
+
+// What the driver changes in a head's host EDID, at boot (GetEdids) as on arrival (RefreshEdid):
+// - a secondary whose identity (manufacturer, product and serial, bytes 8 to 15) matches the primary's gets its
+//   product code and serial nudged, so Windows never conflates twin monitors. QEMU can hand the same identity to
+//   every scanout, and a copy of the primary's EDID always has it. A host that gives distinct identities is kept.
+// - the range-limits descriptor is relaxed, so no mode is pruned against QEMU's conservative analog limits.
+// - the physical size is cleared, so Windows stays at 100% scaling. This recomputes the block-0 checksum, so it
+//   runs last.
+void VioGpuAdapter::NormalizeHostEdid(UINT32 scanId)
+{
+    PAGED_CODE();
+    if (scanId > 0 && m_bEDID[0] && RtlCompareMemory(&m_EDIDs[scanId][8], &m_EDIDs[0][8], 8) == 8)
+    {
+        m_EDIDs[scanId][10] = (BYTE)(m_EDIDs[scanId][10] + scanId); // product code low byte (distinct model)
+        m_EDIDs[scanId][12] = (BYTE)(m_EDIDs[scanId][12] + scanId); // serial byte
+    }
+    RelaxEdidRangeLimits(m_EDIDs[scanId]);
+    NeutralizeEdidPhysicalSize(m_EDIDs[scanId]);
 }
 
 BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
@@ -4164,18 +4169,7 @@ BOOLEAN VioGpuAdapter::RefreshEdid(UINT32 scanId)
     if (validTmp)
     {
         RtlCopyMemory(m_EDIDs[scanId], tmp, EDID_RAW_BLOCK_SIZE);
-        // Distinctness safety: if a generic host hands the SAME identity block to every scanout (manufacturer +
-        // product + serial, bytes 8..15, identical to the primary), Windows would conflate the two monitors
-        // (the non-deterministic "show only on X"). Nudge product code + serial only in that collision case;
-        // a host that already gives distinct/real EDIDs is used verbatim.
-        if (m_bEDID[0] && RtlCompareMemory(&m_EDIDs[scanId][8], &m_EDIDs[0][8], 8) == 8)
-        {
-            m_EDIDs[scanId][10] = (BYTE)(m_EDIDs[scanId][10] + scanId);       // product code low byte
-            m_EDIDs[scanId][12] = (BYTE)(m_EDIDs[scanId][12] + scanId);       // serial byte
-            m_EDIDs[scanId][127] = (BYTE)(m_EDIDs[scanId][127] - 2 * scanId); // keep block-0 checksum == 0
-        }
-        RelaxEdidRangeLimits(m_EDIDs[scanId]);         // no mode pruning against QEMU's conservative analog limits
-        NeutralizeEdidPhysicalSize(m_EDIDs[scanId]);   // force 100% scaling (recomputes checksum, so run last)
+        NormalizeHostEdid(scanId);
         m_bEDID[scanId] = TRUE;
         got = TRUE;
     }
